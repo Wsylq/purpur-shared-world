@@ -78,6 +78,8 @@ public class PurpurConfig {
         set("config-version", 47);
 
         readConfig(PurpurConfig.class, null);
+        // PURPUR - Remote Data System
+        org.purpurmc.purpur.network.RemoteDataManager.init(configFile.getParentFile());
 
         Block.BLOCK_STATE_REGISTRY.forEach(BlockBehaviour.BlockStateBase::initCache);
     }
