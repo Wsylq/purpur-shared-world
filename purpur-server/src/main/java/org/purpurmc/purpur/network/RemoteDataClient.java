@@ -16,11 +16,14 @@ import java.util.logging.Logger;
  * All operations are synchronous from the caller's perspective but use a
  * dedicated reader thread and a future-map to handle pipelined responses.
  *
- * Reconnection: exponential backoff with cap at 30 seconds.
+ * Real-time chunk sync:
+ *   The reader thread handles CHUNK_PUSH packets sent unsolicited by the master.
+ *   When received, the chunk data is immediately written into the local cache
+ *   (putClean) so the next chunk load on this server gets the updated data.
+ *   If the chunk is currently loaded in memory, it is also refreshed via
+ *   RemoteChunkDataHandler.applyPush().
  *
- * Usage:
- *   byte[] data = RemoteDataClient.get().get("player/uuid");
- *   RemoteDataClient.get().put("player/uuid", nbtBytes);
+ * Reconnection: exponential backoff with cap at 30 seconds.
  */
 public class RemoteDataClient {
 
@@ -41,16 +44,14 @@ public class RemoteDataClient {
     private final HmacHelper hmac;
     private final AtomicInteger requestIdGen = new AtomicInteger(1);
 
-    // Pending requests: requestId → CompletableFuture<RemoteDataPacket>
-    private final ConcurrentHashMap<Integer, CompletableFuture<RemoteDataPacket>> pending
-            = new ConcurrentHashMap<>();
+    /** Pending requests: requestId → CompletableFuture */
+    private final ConcurrentHashMap<Integer, CompletableFuture<RemoteDataPacket>> pending = new ConcurrentHashMap<>();
 
     private volatile Socket socket;
     private volatile DataInputStream dis;
     private volatile DataOutputStream dos;
     private volatile boolean connected = false;
     private volatile boolean running = false;
-
     private Thread readerThread;
     private Thread reconnectThread;
 
@@ -61,7 +62,6 @@ public class RemoteDataClient {
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
-
     public void start() {
         running = true;
         reconnectThread = new Thread(this::reconnectLoop, "RemoteData-Reconnect");
@@ -147,8 +147,12 @@ public class RemoteDataClient {
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────
-
-    private int nextId() { return requestIdGen.getAndIncrement(); }
+    private int nextId() {
+        // Reserve 0 for server-push packets; start from 1
+        int id = requestIdGen.getAndIncrement();
+        if (id == 0) id = requestIdGen.getAndIncrement();
+        return id;
+    }
 
     private RemoteDataPacket sendAndWait(RemoteDataPacket pkt) throws Exception {
         int id = pkt.requestId;
@@ -169,18 +173,23 @@ public class RemoteDataClient {
     }
 
     // ── Reader thread ─────────────────────────────────────────────────────────
-
     private void startReader() {
         readerThread = new Thread(() -> {
             while (running && connected) {
                 try {
                     RemoteDataPacket pkt = RemoteDataPacket.readFrom(dis, hmac);
+
+                    // ── Handle unsolicited server-push packets (requestId == 0) ──
+                    if (pkt.requestId == 0) {
+                        handleServerPush(pkt);
+                        continue;
+                    }
+
                     CompletableFuture<RemoteDataPacket> future = pending.remove(pkt.requestId);
                     if (future != null) {
                         future.complete(pkt);
                     } else {
-                        // Unsolicited packet (server push) – handle if needed
-                        LOGGER.fine("[RemoteData] Unsolicited packet: " + pkt.opCode);
+                        LOGGER.fine("[RemoteData] Unsolicited packet with unknown requestId: " + pkt.requestId);
                     }
                 } catch (IOException e) {
                     if (running) {
@@ -195,8 +204,41 @@ public class RemoteDataClient {
         readerThread.start();
     }
 
-    // ── Reconnect loop ────────────────────────────────────────────────────────
+    /**
+     * Handle an unsolicited packet pushed from the master server.
+     * Currently handles CHUNK_PUSH for real-time shared world sync.
+     */
+    private void handleServerPush(RemoteDataPacket pkt) {
+        if (pkt.opCode == RemoteDataPacket.OpCode.CHUNK_PUSH) {
+            String key = pkt.key;
+            byte[] data = pkt.data;
 
+            if (data == null || data.length == 0) {
+                // Empty push = invalidate only
+                RemoteDataCache cache = RemoteDataCache.get();
+                if (cache != null) cache.invalidate(key);
+                LOGGER.fine("[RemoteData] Received CHUNK_PUSH invalidate for key=" + key);
+                return;
+            }
+
+            // Write into local cache (clean = no need to send back to master)
+            RemoteDataCache cache = RemoteDataCache.get();
+            if (cache != null) {
+                cache.putClean(key, data);
+            }
+
+            // If this chunk is currently loaded in the server's world, apply the update live
+            try {
+                RemoteChunkDataHandler.applyPush(key, data);
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "[RemoteData] Failed to apply live chunk push for key=" + key, e);
+            }
+
+            LOGGER.fine("[RemoteData] Applied CHUNK_PUSH key=" + key + " (" + data.length + " bytes)");
+        }
+    }
+
+    // ── Reconnect loop ────────────────────────────────────────────────────────
     private void reconnectLoop() {
         long backoffMs = 1000;
         while (running) {
@@ -207,17 +249,26 @@ public class RemoteDataClient {
                 } catch (Exception e) {
                     LOGGER.warning("[RemoteData] Could not connect to master ("
                             + e.getMessage() + "). Retrying in " + (backoffMs / 1000) + "s...");
-                    try { Thread.sleep(backoffMs); } catch (InterruptedException ie) { break; }
+                    try {
+                        Thread.sleep(backoffMs);
+                    } catch (InterruptedException ie) {
+                        break;
+                    }
                     backoffMs = Math.min(backoffMs * 2, 30_000);
                 }
             } else {
-                try { Thread.sleep(2000); } catch (InterruptedException e) { break; }
+                try {
+                    Thread.sleep(2000);
+                } catch (InterruptedException e) {
+                    break;
+                }
             }
         }
     }
 
     private void connectToMaster() throws IOException {
         closeSocket();
+
         Socket s;
         if (config.useTLS) {
             s = buildTLSSocket();
@@ -228,7 +279,7 @@ public class RemoteDataClient {
                     config.connectTimeoutMs);
         }
         s.setTcpNoDelay(true);
-        s.setSoTimeout(0); // Reader handles its own timeout via futures
+        s.setSoTimeout(0);
         s.setKeepAlive(true);
 
         socket = s;
@@ -274,7 +325,6 @@ public class RemoteDataClient {
 
     private void handleDisconnect() {
         connected = false;
-        // Fail all pending futures
         pending.forEach((id, f) -> f.completeExceptionally(new IOException("Disconnected from master")));
         pending.clear();
         closeSocket();
@@ -290,7 +340,6 @@ public class RemoteDataClient {
     }
 
     // ── TLS ───────────────────────────────────────────────────────────────────
-
     private Socket buildTLSSocket() throws IOException {
         try {
             KeyStore ks = KeyStore.getInstance("JKS");
@@ -302,8 +351,7 @@ public class RemoteDataClient {
             SSLContext ctx = SSLContext.getInstance("TLSv1.3");
             ctx.init(null, tmf.getTrustManagers(), null);
             SSLSocket s = (SSLSocket) ctx.getSocketFactory().createSocket();
-            s.connect(new java.net.InetSocketAddress(config.masterHost, config.masterPort),
-                    config.connectTimeoutMs);
+            s.connect(new java.net.InetSocketAddress(config.masterHost, config.masterPort), config.connectTimeoutMs);
             s.startHandshake();
             return s;
         } catch (Exception e) {

@@ -32,23 +32,26 @@ public class RemoteDataPacket {
     // ── Op codes ─────────────────────────────────────────────────────────────
     public enum OpCode {
         // Client → Master
-        PING          (0x01),
-        AUTH          (0x02),
-        GET           (0x10),
-        PUT           (0x11),
-        DELETE        (0x12),
-        LIST          (0x13),
-        BATCH_PUT     (0x14),
+        PING              (0x01),
+        AUTH              (0x02),
+        GET               (0x10),
+        PUT               (0x11),
+        DELETE            (0x12),
+        LIST              (0x13),
+        BATCH_PUT         (0x14),
+        CHUNK_INVALIDATE  (0x15),  // Client tells master: broadcast invalidation to other clients
+        CHUNK_PUSH_ACK    (0x16),  // Client ACKs a push from master
 
         // Master → Client
-        PONG          (0x81),
-        AUTH_OK       (0x82),
-        AUTH_FAIL     (0x83),
-        DATA          (0x90),
-        NOT_FOUND     (0x91),
-        OK            (0x92),
-        ERROR         (0x93),
-        LIST_RESULT   (0x94);
+        PONG              (0x81),
+        AUTH_OK           (0x82),
+        AUTH_FAIL         (0x83),
+        DATA              (0x90),
+        NOT_FOUND         (0x91),
+        OK                (0x92),
+        ERROR             (0x93),
+        LIST_RESULT       (0x94),
+        CHUNK_PUSH        (0x95);  // Master pushes chunk data to all other clients (real-time sync)
 
         public final byte code;
 
