@@ -225,7 +225,7 @@ public class RemoteDataServer {
                 case PUT -> {
                     storage.put(pkt.key, pkt.data);
                     sendResponse(RemoteDataPacket.OpCode.OK, pkt.requestId, pkt.key, new byte[0]);
-
+                    LOGGER.info("[RemoteData] PUT " + pkt.key);
                     // ── Real-time sync: if this is a chunk key, push to all other clients immediately ──
                     if (pkt.key.startsWith("chunk/")) {
                         broadcastChunkPush(id, pkt.key, pkt.data);

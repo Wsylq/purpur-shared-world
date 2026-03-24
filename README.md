@@ -1,5 +1,10 @@
-<<<<<<< HEAD
-# Sharing a single world in two servers.
-=======
-# Sharing a single world in two servers.
->>>>>>> e6f50c8521b369786329ab57c75f0937eb51a843
+# Sharing a single world in TWO Servers.
+
+## TO-DO
+
+* Chat
+* Syncing Blocks --> `Currently here`
+* Syncing Inventories across Both servers
+* Player Position
+* Real Players
+* COMBAT (if possible)
