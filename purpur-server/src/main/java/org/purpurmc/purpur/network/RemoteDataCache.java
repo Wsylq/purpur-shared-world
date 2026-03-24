@@ -13,21 +13,24 @@ import java.util.logging.Logger;
  *
  * Two-tier local cache sitting between the Minecraft server and the remote master.
  *
- *  Tier 1 – RAM (ConcurrentHashMap with LRU eviction)
- *  Tier 2 – Local disk  (flat key→file mapping under ./remote-cache/)
+ * Tier 1 – RAM (ConcurrentHashMap with LRU eviction)
+ * Tier 2 – Local disk (flat key→file mapping under ./remote-cache/)
  *
  * Dirty tracking: any PUT marks the entry dirty. A background thread
  * periodically flushes dirty entries to the master via RemoteDataClient.
+ * NOTE: With FIX #2 applied, RemoteChunkDataHandler.save() now PUTs to the
+ * master immediately and asynchronously, so the flush thread is a safety-net
+ * for disconnected/retry scenarios only.
  *
  * Write-Ahead Log (WAL): every write is appended to a WAL file before
  * being acknowledged. On startup the WAL is replayed so no writes are
  * lost even if the server crashes before a flush.
  *
  * Key naming convention (imposed by callers):
- *   "player/<uuid>"          → player NBT blob
- *   "chunk/<world>/<x>/<z>"  → chunk NBT blob
- *   "cfg/<filename>"         → config file bytes
- *   "plugin/<name>/<path>"   → plugin data file bytes
+ *   "player/<uuid>"             → player NBT blob
+ *   "chunk/<world>/<x>/<z>"    → chunk NBT blob
+ *   "cfg/<name>"               → config file bytes
+ *   "plugin/<name>/<key>"      → plugin data file bytes
  */
 public class RemoteDataCache {
 
@@ -36,7 +39,9 @@ public class RemoteDataCache {
     // ── Singleton ─────────────────────────────────────────────────────────────
     private static RemoteDataCache INSTANCE;
 
-    public static RemoteDataCache get() { return INSTANCE; }
+    public static RemoteDataCache get() {
+        return INSTANCE;
+    }
 
     public static RemoteDataCache init(RemoteDataConfig config, File serverRoot) {
         INSTANCE = new RemoteDataCache(config, serverRoot);
@@ -55,7 +60,9 @@ public class RemoteDataCache {
             this.lastAccessNs = System.nanoTime();
         }
 
-        void touch() { lastAccessNs = System.nanoTime(); }
+        void touch() {
+            lastAccessNs = System.nanoTime();
+        }
     }
 
     // ── Fields ────────────────────────────────────────────────────────────────
@@ -66,7 +73,7 @@ public class RemoteDataCache {
     /** RAM cache */
     private final ConcurrentHashMap<String, Entry> ramCache = new ConcurrentHashMap<>();
 
-    /** Dirty keys waiting to be flushed to master */
+    /** Dirty keys waiting to be flushed to master (fallback / retry path) */
     private final ConcurrentLinkedQueue<String> dirtyQueue = new ConcurrentLinkedQueue<>();
 
     /** WAL stream (append-only) */
@@ -85,9 +92,7 @@ public class RemoteDataCache {
         this.config = config;
         this.cacheDir = new File(serverRoot, "remote-cache");
         this.walFile = new File(serverRoot, config.walPath);
-
         cacheDir.mkdirs();
-
         if (config.walEnabled) {
             openWAL();
             replayWAL();
@@ -98,7 +103,7 @@ public class RemoteDataCache {
 
     /**
      * Get data for key.
-     * Order: RAM → disk → null (caller must fetch from master).
+     * Order: RAM → disk → null (caller fetches from master directly).
      */
     public byte[] get(String key) {
         Entry e = ramCache.get(key);
@@ -107,20 +112,22 @@ public class RemoteDataCache {
             hits.incrementAndGet();
             return e.data;
         }
-        // Try disk cache
+
         byte[] diskData = readDisk(key);
         if (diskData != null) {
             putRam(key, diskData, false);
             hits.incrementAndGet();
             return diskData;
         }
+
         misses.incrementAndGet();
         return null;
     }
 
     /**
      * Put data into cache (RAM + disk) and mark dirty.
-     * The background flush thread will push to master.
+     * The background flush thread will push to master as a retry/fallback.
+     * (The primary push is now done immediately in RemoteChunkDataHandler.save.)
      */
     public void put(String key, byte[] data) {
         if (config.walEnabled) {
@@ -150,16 +157,18 @@ public class RemoteDataCache {
     }
 
     /**
-     * Returns all keys in the RAM cache (for batch sync purposes).
+     * Returns all dirty keys in the RAM cache (for batch sync fallback).
      */
     public Set<String> dirtyKeys() {
         Set<String> keys = new HashSet<>();
-        ramCache.forEach((k, e) -> { if (e.dirty) keys.add(k); });
+        ramCache.forEach((k, e) -> {
+            if (e.dirty) keys.add(k);
+        });
         return keys;
     }
 
     /**
-     * Mark a key as no longer dirty (after successful flush to master).
+     * Mark a key as no longer dirty (after successful push to master).
      */
     public void markClean(String key) {
         Entry e = ramCache.get(key);
@@ -167,8 +176,7 @@ public class RemoteDataCache {
     }
 
     /**
-     * Get cached data as byte array, returning null if not present.
-     * Non-dirtying peek (for read-through scenarios).
+     * Peek at cached data without marking dirty (for read-through).
      */
     public byte[] peek(String key) {
         Entry e = ramCache.get(key);
@@ -192,14 +200,13 @@ public class RemoteDataCache {
             flushThread.interrupt();
             try { flushThread.join(5000); } catch (InterruptedException ignored) {}
         }
-        // Final flush
         flushDirty(true);
         closeWAL();
         LOGGER.info("[RemoteData] Cache stopped. hits=" + hits.get() + " misses=" + misses.get());
     }
 
     private void flushLoop() {
-        long intervalMs = (long) config.dirtyFlushIntervalTicks * 50L; // ticks → ms (20 TPS = 50ms/tick)
+        long intervalMs = (long) config.dirtyFlushIntervalTicks * 50L; // ticks → ms
         while (running) {
             try {
                 Thread.sleep(intervalMs);
@@ -213,8 +220,9 @@ public class RemoteDataCache {
 
     /**
      * Flush dirty entries to master via RemoteDataClient.
+     * This is the retry/fallback path; primary pushes happen immediately in save().
      *
-     * @param forceAll if true, flush ALL dirty entries (used on shutdown)
+     * @param forceAll flush ALL dirty entries (used on shutdown)
      */
     private void flushDirty(boolean forceAll) {
         RemoteDataClient client = RemoteDataClient.get();
@@ -235,6 +243,7 @@ public class RemoteDataCache {
                 batchData.clear();
             }
         }
+
         if (!batch.isEmpty()) {
             sendBatch(client, batch, batchData);
         }
@@ -244,16 +253,13 @@ public class RemoteDataCache {
         for (int i = 0; i < keys.size(); i++) {
             String key = keys.get(i);
             byte[] data = dataList.get(i);
-            try {
-                client.put(key, data);
+            if (client.put(key, data)) {
                 markClean(key);
-            } catch (Exception ex) {
-                LOGGER.log(Level.WARNING, "[RemoteData] Failed to flush key to master: " + key, ex);
             }
         }
     }
 
-    // ── RAM helpers ───────────────────────────────────────────────────────────
+    // ── RAM cache helpers ─────────────────────────────────────────────────────
 
     private void putRam(String key, byte[] data, boolean dirty) {
         Entry existing = ramCache.get(key);
@@ -267,30 +273,28 @@ public class RemoteDataCache {
     }
 
     private void evictIfNeeded() {
-        while (ramCache.size() > config.maxChunkCacheEntries) {
-            // Evict the LRU entry
-            String lruKey = null;
-            long oldestNs = Long.MAX_VALUE;
-            for (Map.Entry<String, Entry> me : ramCache.entrySet()) {
-                if (!me.getValue().dirty && me.getValue().lastAccessNs < oldestNs) {
-                    oldestNs = me.getValue().lastAccessNs;
-                    lruKey = me.getKey();
-                }
-            }
-            if (lruKey != null) {
-                ramCache.remove(lruKey);
-            } else {
-                break; // all dirty, can't evict
+        if (ramCache.size() <= config.maxChunkCacheEntries) return;
+
+        String lruKey = null;
+        long oldestNs = Long.MAX_VALUE;
+        for (Map.Entry<String, Entry> me : ramCache.entrySet()) {
+            if (!me.getValue().dirty && me.getValue().lastAccessNs < oldestNs) {
+                oldestNs = me.getValue().lastAccessNs;
+                lruKey = me.getKey();
             }
         }
+        if (lruKey != null) ramCache.remove(lruKey);
     }
 
     // ── Disk helpers ──────────────────────────────────────────────────────────
 
     private File diskFile(String key) {
-        // Replace path separators to keep flat structure; use SHA-like naming
-        String safe = key.replace('/', '_').replace('\\', '_');
-        return new File(cacheDir, safe + ".dat");
+        String safePath = key.replace('/', File.separatorChar);
+        File candidate = new File(cacheDir, safePath);
+        if (!candidate.getAbsolutePath().startsWith(cacheDir.getAbsolutePath())) {
+            throw new SecurityException("Path traversal attempt in key: " + key);
+        }
+        return new File(candidate.getAbsolutePath() + ".dat");
     }
 
     private byte[] readDisk(String key) {
@@ -299,49 +303,45 @@ public class RemoteDataCache {
         try {
             return Files.readAllBytes(f.toPath());
         } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "[RemoteData] Disk read failed: " + key, e);
             return null;
         }
     }
 
     private void writeDisk(String key, byte[] data) {
+        File f = diskFile(key);
+        f.getParentFile().mkdirs();
         try {
-            Files.write(diskFile(key).toPath(), data,
-                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            Files.write(f.toPath(), data, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                    StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.SYNC);
         } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "[RemoteData] Could not write disk cache for key: " + key, e);
+            LOGGER.log(Level.WARNING, "[RemoteData] Disk write failed: " + key, e);
         }
     }
 
     private void deleteDisk(String key) {
-        diskFile(key).delete();
+        File f = diskFile(key);
+        if (f.exists()) f.delete();
     }
 
     // ── WAL ───────────────────────────────────────────────────────────────────
 
-    /**
-     * WAL entry format:
-     *   [4] magic = 0xWAL1
-     *   [2] key length
-     *   [N] key bytes (UTF-8)
-     *   [4] data length
-     *   [M] data bytes
-     */
-    private static final int WAL_MAGIC = 0x57414C31; // 'WAL1'
+    private static final int WAL_MAGIC = 0xCAFEBABE;
 
     private void openWAL() {
         synchronized (walLock) {
             try {
-                FileOutputStream fos = new FileOutputStream(walFile, true); // append
-                walOut = new DataOutputStream(new BufferedOutputStream(fos, 65536));
+                walOut = new DataOutputStream(new BufferedOutputStream(
+                        new FileOutputStream(walFile, true), 65536));
             } catch (IOException e) {
-                LOGGER.log(Level.SEVERE, "[RemoteData] Could not open WAL file: " + walFile, e);
+                LOGGER.log(Level.WARNING, "[RemoteData] Could not open WAL file", e);
             }
         }
     }
 
     private void appendWAL(String key, byte[] data) {
-        if (walOut == null) return;
         synchronized (walLock) {
+            if (walOut == null) return;
             try {
                 byte[] keyBytes = key.getBytes(java.nio.charset.StandardCharsets.UTF_8);
                 walOut.writeInt(WAL_MAGIC);
@@ -351,14 +351,14 @@ public class RemoteDataCache {
                 walOut.write(data);
                 walOut.flush();
             } catch (IOException e) {
-                LOGGER.log(Level.WARNING, "[RemoteData] WAL write failed", e);
+                LOGGER.log(Level.WARNING, "[RemoteData] WAL append failed", e);
             }
         }
     }
 
     private void replayWAL() {
         if (!walFile.exists() || walFile.length() == 0) return;
-        LOGGER.info("[RemoteData] Replaying WAL: " + walFile);
+        LOGGER.info("[RemoteData] Replaying WAL from " + walFile.getAbsolutePath());
         int replayed = 0;
         try (DataInputStream dis = new DataInputStream(
                 new BufferedInputStream(new FileInputStream(walFile)))) {
@@ -375,23 +375,19 @@ public class RemoteDataCache {
                 int dataLen = dis.readInt();
                 byte[] data = new byte[dataLen];
                 dis.readFully(data);
-                // Restore to RAM & disk (dirty so it gets pushed to master)
                 putRam(key, data, true);
                 writeDisk(key, data);
                 dirtyQueue.offer(key);
                 replayed++;
             }
         } catch (EOFException ignored) {
-            // partial last entry – that's fine
+            // partial last entry – fine
         } catch (IOException e) {
             LOGGER.log(Level.WARNING, "[RemoteData] Error replaying WAL", e);
         }
         LOGGER.info("[RemoteData] WAL replay complete. Recovered " + replayed + " entries.");
-
         // Truncate WAL after successful replay
-        try {
-            new FileOutputStream(walFile, false).close();
-        } catch (IOException ignored) {}
+        try { new FileOutputStream(walFile, false).close(); } catch (IOException ignored) {}
     }
 
     private void closeWAL() {
@@ -401,9 +397,6 @@ public class RemoteDataCache {
                 walOut = null;
             }
         }
-        // WAL is done; clear it
-        try {
-            new FileOutputStream(walFile, false).close();
-        } catch (IOException ignored) {}
+        try { new FileOutputStream(walFile, false).close(); } catch (IOException ignored) {}
     }
 }

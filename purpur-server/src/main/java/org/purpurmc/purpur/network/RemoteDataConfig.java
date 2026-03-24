@@ -42,11 +42,13 @@ public class RemoteDataConfig {
     // ── singleton ────────────────────────────────────────────────────────────
     private static RemoteDataConfig INSTANCE;
 
+    /**
+     * FIX #6: Return null instead of throwing when not initialised yet.
+     * The old code threw IllegalStateException which could crash the server
+     * during early startup before the config was loaded.
+     */
     public static RemoteDataConfig get() {
-        if (INSTANCE == null) {
-            throw new IllegalStateException("RemoteDataConfig has not been initialised yet");
-        }
-        return INSTANCE;
+        return INSTANCE; // may be null – callers must null-check
     }
 
     public static RemoteDataConfig init(File serverRoot) {

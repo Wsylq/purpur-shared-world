@@ -29,7 +29,7 @@ public class RemoteDataPacket {
     public static final int HEADER_SIZE = 4 + 1 + 4 + 2 + 1 + 4; // 16 bytes before data
     public static final int HMAC_SIZE = 32;
 
-    // ── Op codes ─────────────────────────────────────────────────────────────
+    // ── Op codes ──────────────────────────────────────────────────────────────
     public enum OpCode {
         // Client → Master
         PING              (0x01),
@@ -94,7 +94,7 @@ public class RemoteDataPacket {
         this.wasCompressed = wasCompressed;
     }
 
-    // ── Serialisation ─────────────────────────────────────────────────────────
+    // ── Serialisation ──────────────────────────────────────────────────────────
 
     /**
      * Serialise to wire format and write to the stream.
@@ -139,10 +139,6 @@ public class RemoteDataPacket {
      * Throws IOException if the HMAC doesn't match (tampered / wrong key).
      */
     public static RemoteDataPacket readFrom(DataInputStream in, HmacHelper hmac) throws IOException {
-        // We need to read everything into a buffer first so we can verify HMAC
-        // Strategy: read header fields, accumulate bytes, then read+check HMAC.
-
-        // Capture raw bytes as we read
         ByteArrayOutputStream rawBuf = new ByteArrayOutputStream();
         DataOutputStream raw = new DataOutputStream(rawBuf);
 
@@ -185,7 +181,8 @@ public class RemoteDataPacket {
             payload = ungzip(payload);
         }
 
-        return new RemoteDataPacket(op, reqId, new String(keyBytes, StandardCharsets.UTF_8), payload, compressed);
+        return new RemoteDataPacket(op, reqId,
+                new String(keyBytes, StandardCharsets.UTF_8), payload, compressed);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

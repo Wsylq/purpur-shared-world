@@ -14,18 +14,18 @@ import java.util.logging.Logger;
  *
  * Runs on the MASTER server only.
  * Accepts TCP connections from player servers, authenticates them, then
- * processes GET / PUT / DELETE / LIST / BATCH_PUT / PING / CHUNK_INVALIDATE operations.
+ * processes GET / PUT / DELETE / LIST / BATCH_PUT / PING / CHUNK_INVALIDATE.
  *
  * Real-time chunk sync:
- *   When a client PUTs a chunk key, the master stores it AND broadcasts
- *   a CHUNK_PUSH packet (containing the full chunk data) to ALL other
- *   authenticated clients immediately. This ensures every player server
- *   gets the updated chunk data in real-time without polling.
+ * When a client PUTs a chunk key, the master stores it AND broadcasts
+ * a CHUNK_PUSH packet (containing the full chunk data) to ALL other
+ * authenticated clients immediately. This ensures every player server
+ * gets the updated chunk data in real-time.
  *
  * Storage backend: RemoteDataStorage (pluggable – default is flat-file).
  *
  * One thread per connected client (thread-per-connection model).
- * Suitable for a small number of player servers (<= 20).
+ * Suitable for a small number of player servers (<= 10).
  */
 public class RemoteDataServer {
 
@@ -46,10 +46,10 @@ public class RemoteDataServer {
     private final HmacHelper hmac;
     private final RemoteDataStorage storage;
     private ServerSocket serverSocket;
-    private volatile boolean running = false;
     private Thread acceptThread;
+    private volatile boolean running = false;
 
-    /** All authenticated connected clients: id → handler */
+    /** Connected authenticated clients: clientId → handler */
     private final ConcurrentHashMap<String, ClientHandler> clients = new ConcurrentHashMap<>();
 
     /** Thread pool for client handlers */
@@ -87,9 +87,7 @@ public class RemoteDataServer {
 
     public void stop() {
         running = false;
-        try {
-            if (serverSocket != null) serverSocket.close();
-        } catch (IOException ignored) {}
+        try { if (serverSocket != null) serverSocket.close(); } catch (IOException ignored) {}
         clients.values().forEach(ClientHandler::close);
         clients.clear();
         clientPool.shutdownNow();
@@ -103,8 +101,7 @@ public class RemoteDataServer {
                 Socket s = serverSocket.accept();
                 s.setTcpNoDelay(true);
                 s.setKeepAlive(true);
-                ClientHandler handler = new ClientHandler(s);
-                clientPool.submit(handler);
+                clientPool.submit(new ClientHandler(s));
             } catch (IOException e) {
                 if (running) {
                     LOGGER.log(Level.WARNING, "[RemoteData] Accept error", e);
@@ -117,23 +114,20 @@ public class RemoteDataServer {
 
     /**
      * Broadcast a CHUNK_PUSH packet to all authenticated clients EXCEPT the sender.
-     * This is the core of real-time shared world sync.
      *
-     * @param senderClientId  the client ID of the server that sent the chunk update (excluded from broadcast)
-     * @param chunkKey        the chunk key e.g. "chunk/world/4/-9"
-     * @param chunkData       the full chunk NBT bytes
+     * @param senderClientId the client that sent the PUT (excluded from broadcast)
+     * @param chunkKey       e.g. "chunk/world/4/-9"
+     * @param chunkData      the full chunk NBT bytes
      */
     private void broadcastChunkPush(String senderClientId, String chunkKey, byte[] chunkData) {
         RemoteDataPacket pushPkt = new RemoteDataPacket(
                 RemoteDataPacket.OpCode.CHUNK_PUSH,
-                0, // requestId 0 = unsolicited push, no response expected
+                0,   // requestId 0 = unsolicited push, no response expected
                 chunkKey,
                 chunkData
         );
-
         int sent = 0;
         for (java.util.Map.Entry<String, ClientHandler> entry : clients.entrySet()) {
-            // Skip the sender
             if (entry.getKey().equals(senderClientId)) continue;
             ClientHandler target = entry.getValue();
             if (!target.authenticated) continue;
@@ -145,7 +139,6 @@ public class RemoteDataServer {
                         + " to client " + entry.getKey() + ": " + e.getMessage());
             }
         }
-
         if (sent > 0) {
             LOGGER.fine("[RemoteData] Broadcast CHUNK_PUSH key=" + chunkKey + " to " + sent + " client(s)");
         }
@@ -171,7 +164,6 @@ public class RemoteDataServer {
                 dis = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 65536));
                 dos = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 65536));
                 LOGGER.info("[RemoteData] Client connected: " + id);
-
                 while (running && !socket.isClosed()) {
                     handlePacket();
                 }
@@ -191,7 +183,6 @@ public class RemoteDataServer {
         private void handlePacket() throws IOException {
             RemoteDataPacket pkt = RemoteDataPacket.readFrom(dis, hmac);
 
-            // Must authenticate first
             if (!authenticated) {
                 if (pkt.opCode == RemoteDataPacket.OpCode.AUTH) {
                     String suppliedKey = new String(pkt.data, java.nio.charset.StandardCharsets.UTF_8);
@@ -212,7 +203,6 @@ public class RemoteDataServer {
 
             switch (pkt.opCode) {
                 case PING -> sendResponse(RemoteDataPacket.OpCode.PONG, pkt.requestId, "", new byte[0]);
-
                 case GET -> {
                     byte[] data = storage.get(pkt.key);
                     if (data != null) {
@@ -221,44 +211,36 @@ public class RemoteDataServer {
                         sendResponse(RemoteDataPacket.OpCode.NOT_FOUND, pkt.requestId, pkt.key, new byte[0]);
                     }
                 }
-
                 case PUT -> {
                     storage.put(pkt.key, pkt.data);
                     sendResponse(RemoteDataPacket.OpCode.OK, pkt.requestId, pkt.key, new byte[0]);
                     LOGGER.info("[RemoteData] PUT " + pkt.key);
-                    // ── Real-time sync: if this is a chunk key, push to all other clients immediately ──
+                    // Real-time sync: broadcast to all other clients immediately
                     if (pkt.key.startsWith("chunk/")) {
                         broadcastChunkPush(id, pkt.key, pkt.data);
                     }
                 }
-
                 case DELETE -> {
                     storage.delete(pkt.key);
                     sendResponse(RemoteDataPacket.OpCode.OK, pkt.requestId, pkt.key, new byte[0]);
                 }
-
                 case LIST -> {
                     String[] keys = storage.list(pkt.key);
-                    byte[] result = String.join("\n", keys).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    byte[] result = String.join("\n", keys)
+                            .getBytes(java.nio.charset.StandardCharsets.UTF_8);
                     sendResponse(RemoteDataPacket.OpCode.LIST_RESULT, pkt.requestId, pkt.key, result);
                 }
-
                 case BATCH_PUT -> {
                     parseBatchPut(pkt);
                     sendResponse(RemoteDataPacket.OpCode.OK, pkt.requestId, "", new byte[0]);
                 }
-
                 case CHUNK_INVALIDATE -> {
-                    // A client explicitly requests invalidation broadcast (no data, just key)
-                    // Used when a client wants others to re-fetch a chunk without sending the full data
-                    // We fetch from storage and push to all others
                     byte[] data = storage.get(pkt.key);
                     if (data != null) {
                         broadcastChunkPush(id, pkt.key, data);
                     }
                     sendResponse(RemoteDataPacket.OpCode.OK, pkt.requestId, pkt.key, new byte[0]);
                 }
-
                 default -> sendResponse(RemoteDataPacket.OpCode.ERROR, pkt.requestId, "",
                         ("Unknown op: " + pkt.opCode).getBytes());
             }
@@ -276,8 +258,6 @@ public class RemoteDataServer {
                 byte[] data = new byte[dataLen];
                 batch.readFully(data);
                 storage.put(key, data);
-
-                // Broadcast chunk pushes from batch as well
                 if (key.startsWith("chunk/")) {
                     broadcastChunkPush(id, key, data);
                 }
@@ -290,14 +270,13 @@ public class RemoteDataServer {
             }
         }
 
-        private void sendResponse(RemoteDataPacket.OpCode op, int requestId, String key, byte[] data) throws IOException {
+        private void sendResponse(RemoteDataPacket.OpCode op, int requestId, String key, byte[] data)
+                throws IOException {
             sendPacket(new RemoteDataPacket(op, requestId, key, data));
         }
 
         void close() {
-            try {
-                if (!socket.isClosed()) socket.close();
-            } catch (IOException ignored) {}
+            try { if (!socket.isClosed()) socket.close(); } catch (IOException ignored) {}
         }
     }
 
@@ -308,11 +287,13 @@ public class RemoteDataServer {
             try (FileInputStream fis = new FileInputStream(config.tlsKeystorePath)) {
                 ks.load(fis, config.tlsKeystorePassword.toCharArray());
             }
-            KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+            KeyManagerFactory kmf = KeyManagerFactory.getInstance(
+                    KeyManagerFactory.getDefaultAlgorithm());
             kmf.init(ks, config.tlsKeystorePassword.toCharArray());
             SSLContext ctx = SSLContext.getInstance("TLSv1.3");
             ctx.init(kmf.getKeyManagers(), null, null);
-            SSLServerSocket ss = (SSLServerSocket) ctx.getServerSocketFactory().createServerSocket(config.masterPort);
+            SSLServerSocket ss = (SSLServerSocket)
+                    ctx.getServerSocketFactory().createServerSocket(config.masterPort);
             ss.setReuseAddress(true);
             return ss;
         } catch (Exception e) {
