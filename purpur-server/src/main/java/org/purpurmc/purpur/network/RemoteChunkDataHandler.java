@@ -19,36 +19,33 @@ import java.util.logging.Logger;
  * Intercepts chunk NBT save/load so chunk data flows through the remote
  * cache/master system.
  *
- * Key format:  "chunk/<worldName>/<chunkX>/<chunkZ>"
+ * Key format: "chunk/<worldName>/<x>/<z>"
  *
- * ── How this is hooked into Minecraft ──────────────────────────────────────
- * Patch net.minecraft.world.level.chunk.storage.RegionFileStorage (Paper mapped):
+ * ── How this is hooked into Minecraft ────────────────────────────────────────
+ *
+ * The hook is in RegionFileStorage.java.patch:
  *
  *   write(ChunkPos pos, CompoundTag tag):
- *       RemoteChunkDataHandler.save(worldName, pos, tag);
- *       // then call original write so data is also kept on local disk
+ *     RemoteChunkDataHandler.save(worldName, pos, tag);   ← called BEFORE super.write()
+ *     super.write(pos, tag);                              ← local disk write still happens
  *
  *   read(ChunkPos pos):
- *       CompoundTag remote = RemoteChunkDataHandler.load(worldName, pos);
- *       if (remote != null) return remote;
- *       // fall through to original disk read
+ *     CompoundTag remote = RemoteChunkDataHandler.load(worldName, pos);
+ *     if (remote != null) return remote;                  ← use master data if available
+ *     return super.read(pos);                             ← fall back to local disk
  *
- * The patch must be added to:
- *   purpur-server/minecraft-patches/sources/
- *       net/minecraft/world/level/chunk/storage/RegionFileStorage.java.patch
+ * ── Strategy ──────────────────────────────────────────────────────────────────
  *
- * ── Strategy ────────────────────────────────────────────────────────────────
- *  WRITE → immediately PUT to master (async via client thread), also marks
- *          local cache dirty as a fallback if client is temporarily disconnected.
+ * WRITE → immediately PUT to master (async virtual thread), also marks local
+ *         cache dirty as a fallback if the connection is temporarily down.
  *
- *  READ  → try master first (via RAM cache → disk cache → live master GET),
- *          return null only when nothing is found so Minecraft falls back to
- *          its own local RegionFile read.
+ * READ  → try master first (RAM cache → live master GET), return null to fall
+ *         back to Minecraft's own local RegionFile read if nothing found.
  *
- *  PUSH  → when the master broadcasts a CHUNK_PUSH to this client,
- *          applyPush() writes the data to local cache AND schedules a
- *          chunk reload on the server's main thread so the in-memory
- *          LevelChunk is refreshed immediately.
+ * PUSH  → when the master broadcasts a CHUNK_PUSH to this client,
+ *         applyPush() writes data to local cache AND force-unloads the chunk
+ *         on the main thread so the in-memory LevelChunk is refreshed
+ *         immediately using Bukkit's stable World.unloadChunk() API.
  */
 public final class RemoteChunkDataHandler {
 
@@ -60,74 +57,36 @@ public final class RemoteChunkDataHandler {
     // ── Public API ────────────────────────────────────────────────────────────
 
     /**
-     * FIX #1 & #2 (combined):
+     * Save chunk NBT. Called from the RegionFileStorage patch BEFORE the
+     * local disk write. Immediately PUTs to master on a virtual thread so
+     * other servers receive the data without waiting for the flush interval.
      *
-     * Save chunk NBT. Immediately PUTs to master synchronously on a virtual
-     * thread (non-blocking from MC thread's perspective). This replaces the
-     * old lazy 5-second flush which caused the master to never receive data
-     * in time for a same-session sync.
-     *
-     * The local cache is also updated so reads from this server itself are
-     * consistent.
-     *
-     * @param level     the ServerLevel (used to derive a stable world name)
+     * @param worldName dimension folder name (e.g. "world", "world_nether")
      * @param pos       ChunkPos
-     * @param tag       the chunk CompoundTag to save
-     */
-    public static void save(ServerLevel level, ChunkPos pos, CompoundTag tag) {
-        if (!isEnabled()) return;
-        try {
-            String worldName = levelToWorldName(level);
-            String key = buildKey(worldName, pos);
-            byte[] bytes = tagToBytes(tag);
-
-            // Write into local cache immediately (dirty flag set)
-            RemoteDataCache cache = RemoteDataCache.get();
-            if (cache != null) {
-                cache.put(key, bytes);
-            }
-
-            // FIX #2: Push to master immediately and asynchronously,
-            // do NOT wait for the 5-second flush thread.
-            RemoteDataClient client = RemoteDataClient.get();
-            if (client != null && client.isConnected()) {
-                Thread.ofVirtual().name("RemoteData-ImmediatePush").start(() -> {
-                    boolean ok = client.put(key, bytes);
-                    if (ok && cache != null) {
-                        cache.markClean(key); // already on master; no need to flush again
-                    }
-                    LOGGER.info("[RemoteData] SAVE key=" + key);
-                });
-            }
-        } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "[RemoteData] Chunk save failed for " + pos, e);
-        }
-    }
-
-    /**
-     * Convenience overload that accepts the world name as a string directly.
-     * Used when called from a RegionFileStorage patch that already has the
-     * folder name available.
+     * @param tag       chunk CompoundTag
      */
     public static void save(String worldName, ChunkPos pos, CompoundTag tag) {
         if (!isEnabled()) return;
         try {
-            String key = buildKey(worldName, pos);
+            String key   = buildKey(worldName, pos);
             byte[] bytes = tagToBytes(tag);
 
+            // Write into local cache immediately (dirty = true as fallback)
             RemoteDataCache cache = RemoteDataCache.get();
             if (cache != null) {
                 cache.put(key, bytes);
             }
 
+            // Push to master immediately and asynchronously.
+            // The virtual thread does not block the Minecraft save thread.
             RemoteDataClient client = RemoteDataClient.get();
             if (client != null && client.isConnected()) {
-                Thread.ofVirtual().name("RemoteData-ImmediatePush").start(() -> {
+                final RemoteDataCache cacheRef = cache;
+                Thread.ofVirtual().name("RemoteData-Push-" + key).start(() -> {
                     boolean ok = client.put(key, bytes);
-                    if (ok && cache != null) {
-                        cache.markClean(key);
+                    if (ok && cacheRef != null) {
+                        cacheRef.markClean(key); // master has it; no need to flush again
                     }
-                    LOGGER.info("[RemoteData] SAVE key=" + key);
                 });
             }
         } catch (Exception e) {
@@ -136,43 +95,50 @@ public final class RemoteChunkDataHandler {
     }
 
     /**
-     * FIX #4: Load chunk NBT. Always tries the master first (via local RAM
-     * cache → disk cache → live master GET).
+     * Overload that accepts a ServerLevel directly.
+     * Derives the world name via the stable Bukkit API.
+     */
+    public static void save(ServerLevel level, ChunkPos pos, CompoundTag tag) {
+        save(levelToWorldName(level), pos, tag);
+    }
+
+    /**
+     * Load chunk NBT. Called from the RegionFileStorage patch BEFORE the
+     * local disk read. Always tries the master first so this server always
+     * gets the freshest copy of the chunk.
      *
-     * The old code returned local cache first, meaning a chunk present on
-     * this server's own disk was never overridden by the master's copy.
-     *
-     * Returns null if nothing is found remotely – Minecraft will then fall
-     * back to reading from its own local RegionFile.
+     * Returns null if nothing is found remotely → Minecraft falls back to its
+     * own local RegionFile read.
      *
      * @param worldName dimension folder name (e.g. "world", "world_nether")
      * @param pos       ChunkPos
-     * @return CompoundTag, or null if not found remotely
+     * @return CompoundTag from master, or null if not found remotely
      */
     public static CompoundTag load(String worldName, ChunkPos pos) {
         if (!isEnabled()) return null;
         try {
             String key = buildKey(worldName, pos);
-            RemoteDataCache cache = RemoteDataCache.get();
 
-            // FIX #4: Try master/network first, THEN fall back to local cache.
-            // Step 1: check live master connection for the freshest copy.
+            // 1. Try live master connection for the freshest copy.
             RemoteDataClient client = RemoteDataClient.get();
             if (client != null && client.isConnected()) {
                 byte[] bytes = client.get(key);
                 if (bytes != null) {
-                    if (cache != null) cache.putClean(key, bytes); // warm local cache
+                    // Warm the local cache with the received data
+                    RemoteDataCache cache = RemoteDataCache.get();
+                    if (cache != null) cache.putClean(key, bytes);
                     return bytesToTag(bytes);
                 }
             }
 
-            // Step 2: master unavailable / not found – try local RAM cache.
+            // 2. Master unavailable / not found – try local RAM cache.
+            RemoteDataCache cache = RemoteDataCache.get();
             if (cache != null) {
                 byte[] bytes = cache.get(key);
                 if (bytes != null) return bytesToTag(bytes);
             }
 
-            // Step 3: nothing found remotely → return null (Minecraft uses local disk).
+            // 3. Nothing found remotely → return null (Minecraft uses local disk).
             return null;
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "[RemoteData] Chunk load failed: " + worldName + " " + pos, e);
@@ -181,50 +147,52 @@ public final class RemoteChunkDataHandler {
     }
 
     /**
-     * FIX #3 (applyPush fix):
-     *
      * Called by RemoteDataClient when the master broadcasts a CHUNK_PUSH.
-     * Writes data to local cache AND schedules a chunk reload on the main
-     * thread so the in-memory LevelChunk on this server reflects the changes
-     * that another server just saved.
      *
-     * Previously this only updated the cache (dead code path) and never
-     * triggered a reload, so chunks appeared unchanged on other servers.
+     * 1. Writes the fresh data into the local cache.
+     * 2. Schedules a chunk force-unload on the main server thread so the
+     *    in-memory LevelChunk is dropped and will be re-read (via our patched
+     *    RegionFileStorage.read → load() above) next time a player loads it.
+     *
+     * Uses only the stable Bukkit API (World.unloadChunk) — no private NMS.
      */
     public static void applyPush(String key, byte[] bytes) {
         if (!isEnabled()) return;
         try {
-            // 1. Write into local cache (clean – no need to re-push to master)
+            // 1. Write into local cache (clean – no need to push back to master)
             RemoteDataCache cache = RemoteDataCache.get();
             if (cache != null) {
                 cache.putClean(key, bytes);
             }
 
-            // 2. FIX #3: Parse the key and schedule a chunk reload on the main thread.
-            // Key format: chunk/<world>/<x>/<z>
-            ChunkPos pos = parseChunkPos(key);
-            String worldName = parseWorldName(key);
+            // 2. Parse key: "chunk/<worldName>/<x>/<z>"
+            ChunkPos pos       = parseChunkPos(key);
+            String   worldName = parseWorldName(key);
             if (pos == null || worldName == null) return;
 
             MinecraftServer server = MinecraftServer.getServer();
             if (server == null) return;
 
-            // Schedule on the main server thread to avoid concurrency issues
+            // 3. Schedule on the main server thread – chunk API is not thread-safe
             server.execute(() -> {
-                for (ServerLevel level : server.getAllLevels()) {
-                    if (!levelToWorldName(level).equals(worldName)) continue;
+                try {
+                    // Match the world by its folder/name via the stable Bukkit API
+                    for (ServerLevel level : server.getAllLevels()) {
+                        if (!levelToWorldName(level).equals(worldName)) continue;
 
-                    // If chunk is currently loaded in this server's memory, unload it
-                    // so it gets re-read from the (now updated) cache on next access.
-                    long chunkKey = pos.toLong();
-                    if (level.getChunkSource().isChunkLoaded(pos.x, pos.z)) {
-                        // Force the chunk to be saved-then-dropped so next load
-                        // goes through our patched RegionFileStorage.read() → load().
-                        level.getChunkSource().chunkMap.scheduleUnload(chunkKey,
-                                level.getChunkSource().chunkMap.updatingChunkMap.get(chunkKey));
-                        LOGGER.info("[RemoteData] Scheduled chunk reload for key=" + key);
+                        org.bukkit.World bukkitWorld = level.getWorld();
+                        if (bukkitWorld == null) break;
+
+                        if (bukkitWorld.isChunkLoaded(pos.x, pos.z)) {
+                            // save=false: discard in-memory copy, keep our cache data intact.
+                            // Next load will go through patched read() → load() → gets fresh data.
+                            bukkitWorld.unloadChunk(pos.x, pos.z, false);
+                            LOGGER.fine("[RemoteData] Unloaded chunk for push: " + key);
+                        }
+                        break;
                     }
-                    break;
+                } catch (Exception ex) {
+                    LOGGER.log(Level.WARNING, "[RemoteData] applyPush main-thread unload failed: " + key, ex);
                 }
             });
 
@@ -237,47 +205,62 @@ public final class RemoteChunkDataHandler {
 
     private static boolean isEnabled() {
         RemoteDataConfig cfg = RemoteDataConfig.get();
-        return cfg != null && cfg.enabled; // FIX #6: get() now returns null instead of throwing
+        return cfg != null && cfg.enabled;
     }
 
     /**
-     * FIX #5: Derive world name from the level's dimension path instead of
-     * using the buggy normalizeWorld() that had a broken arithmetic expression.
+     * Derive a stable world-folder name from a ServerLevel.
      *
-     * Produces: "world" (overworld), "world_nether", "world_the_end"
-     * matching the default Minecraft folder naming.
+     * Uses the Bukkit World.getName() API which always returns the actual
+     * folder name regardless of the Minecraft version.
+     *
+     * Falls back to parsing the dimension key string for edge cases where
+     * getWorld() returns null (e.g. very early in startup).
      */
     static String levelToWorldName(ServerLevel level) {
-        String dimPath = level.dimension().location().getPath(); // e.g. "overworld", "the_nether", "the_end"
-        return switch (dimPath) {
-            case "overworld" -> "world";
-            case "the_nether" -> "world_nether";
-            case "the_end"   -> "world_the_end";
-            default          -> dimPath; // custom dimensions: use path as-is
-        };
+        // Primary: Bukkit API – always gives the exact folder name
+        try {
+            org.bukkit.World world = level.getWorld();
+            if (world != null) {
+                return world.getName();
+            }
+        } catch (Exception ignored) {}
+
+        // Fallback: parse the dimension ResourceKey toString()
+        // ResourceKey.toString() gives something like "ResourceKey[minecraft:level / minecraft:overworld]"
+        try {
+            String dimStr = level.dimension().toString();
+            if (dimStr.contains("overworld"))  return "world";
+            if (dimStr.contains("the_nether")) return "world_nether";
+            if (dimStr.contains("the_end"))    return "world_the_end";
+        } catch (Exception ignored) {}
+
+        return "world"; // safe default
     }
 
     private static String buildKey(String worldName, ChunkPos pos) {
         return KEY_PREFIX + worldName + "/" + pos.x + "/" + pos.z;
     }
 
-    /** Parse the world name segment from a chunk key like "chunk/world/4/-9" */
-    private static String parseWorldName(String key) {
-        // key = "chunk/<world>/<x>/<z>"
-        String[] parts = key.split("/");
-        if (parts.length < 4) return null;
-        // parts[0]="chunk", parts[1]=world, parts[2]=x, parts[3]=z
-        // world name itself may contain underscores but no slashes
-        return parts[1];
+    /** Parse the world name from a key like "chunk/world_nether/4/-9" */
+    static String parseWorldName(String key) {
+        // key = "chunk/<worldName>/<x>/<z>"
+        // worldName itself may contain underscores but never slashes.
+        if (!key.startsWith(KEY_PREFIX)) return null;
+        String rest = key.substring(KEY_PREFIX.length()); // "<worldName>/<x>/<z>"
+        int firstSlash = rest.indexOf('/');
+        if (firstSlash < 0) return null;
+        return rest.substring(0, firstSlash);
     }
 
-    /** Parse ChunkPos from a chunk key like "chunk/world/4/-9" */
-    private static ChunkPos parseChunkPos(String key) {
+    /** Parse ChunkPos from a key like "chunk/world/4/-9" */
+    static ChunkPos parseChunkPos(String key) {
         String[] parts = key.split("/");
+        // parts[0]="chunk", parts[1]=worldName, parts[2]=x, parts[3]=z
         if (parts.length < 4) return null;
         try {
-            int x = Integer.parseInt(parts[2]);
-            int z = Integer.parseInt(parts[3]);
+            int x = Integer.parseInt(parts[parts.length - 2]);
+            int z = Integer.parseInt(parts[parts.length - 1]);
             return new ChunkPos(x, z);
         } catch (NumberFormatException e) {
             return null;
