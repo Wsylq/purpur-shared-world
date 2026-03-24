@@ -10,28 +10,16 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * RemoteDataClient
+ * RemoteDataClient – connects to the master server.
  *
- * Maintains a persistent TCP (optionally TLS) connection to the master server.
- *
- * FIX FOR TIMEOUT BUG:
- * ─────────────────────
- * The original code used a single readTimeoutMs for ALL operations (default 3000 ms).
- * Chunk NBT payloads can be 8–64 KB compressed. At even 10 MB/s that's fine, but
- * the synchronized(dos) write + network flush + server processing + synchronized
- * response read all have to fit inside 3000 ms while other threads may be competing
- * for the same dos lock.
- *
- * Fix: two separate timeouts:
- *   • shortTimeoutMs  – for PING, GET, DELETE, AUTH (small, fast)
- *   • chunkTimeoutMs  – for PUT of chunk/* keys (large payload, needs more time)
- *
- * Additionally, all pending futures are keyed to their request ID.  If two threads
- * both try to PUT the same key (immediate virtual thread + flush thread retry), only
- * the first one actually writes to the wire; the second sees the key is in-flight and
- * waits for its future to complete rather than firing a duplicate write.
- *
- * Reconnection: exponential backoff capped at 30 seconds.
+ * v2 changes:
+ *   • sendBlockUpdate(world, x, y, z, blockStateString) – fires a BLOCK_UPDATE
+ *     packet to master, which master immediately re-broadcasts as BLOCK_PUSH to
+ *     all other servers.  This is the real-time block sync path.
+ *   • handleServerPush() now handles both CHUNK_PUSH and BLOCK_PUSH.
+ *   • BLOCK_PUSH is handled by RemoteBlockHandler.applyPush().
+ *   • requestId == 0 packets (server pushes) are detected BEFORE the pending-
+ *     futures lookup and dispatched directly — they were previously silently dropped.
  */
 public class RemoteDataClient {
 
@@ -39,29 +27,25 @@ public class RemoteDataClient {
 
     // ── Singleton ────────────────────────────────────────────────────────────
     private static RemoteDataClient INSTANCE;
-    public static RemoteDataClient get()                        { return INSTANCE; }
-    public static RemoteDataClient init(RemoteDataConfig cfg)   { INSTANCE = new RemoteDataClient(cfg); return INSTANCE; }
+    public static RemoteDataClient get()              { return INSTANCE; }
+    public static RemoteDataClient init(RemoteDataConfig cfg) {
+        INSTANCE = new RemoteDataClient(cfg);
+        return INSTANCE;
+    }
 
     // ── Fields ───────────────────────────────────────────────────────────────
     private final RemoteDataConfig config;
     private final HmacHelper       hmac;
     private final AtomicInteger    requestIdGen = new AtomicInteger(1);
 
-    /** Pending request futures: requestId → future */
-    private final ConcurrentHashMap<Integer, CompletableFuture<RemoteDataPacket>> pending = new ConcurrentHashMap<>();
-
-    /**
-     * In-flight PUT tracker: chunkKey → future that completes when the PUT
-     * finishes (success or failure).  Prevents the flush-thread from firing a
-     * duplicate PUT while an immediate virtual-thread push is still in progress.
-     */
-    private final ConcurrentHashMap<String, CompletableFuture<Boolean>> inFlightPuts = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, CompletableFuture<RemoteDataPacket>> pending      = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String,  CompletableFuture<Boolean>>          inFlightPuts = new ConcurrentHashMap<>();
 
     private volatile Socket           socket;
     private volatile DataInputStream  dis;
     private volatile DataOutputStream dos;
-    private volatile boolean          connected = false;
-    private volatile boolean          running   = false;
+    private volatile boolean connected = false;
+    private volatile boolean running   = false;
 
     private Thread readerThread;
     private Thread reconnectThread;
@@ -74,7 +58,7 @@ public class RemoteDataClient {
 
     // ── Lifecycle ────────────────────────────────────────────────────────────
     public void start() {
-        running         = true;
+        running = true;
         reconnectThread = new Thread(this::reconnectLoop, "RemoteData-Reconnect");
         reconnectThread.setDaemon(true);
         reconnectThread.start();
@@ -93,92 +77,90 @@ public class RemoteDataClient {
 
     // ── Public API ───────────────────────────────────────────────────────────
 
-    /** Fetch a value from the master.  Returns null if not found or on error. */
     public byte[] get(String key) {
         if (!connected) return null;
         try {
             RemoteDataPacket resp = sendAndWait(
-                new RemoteDataPacket(RemoteDataPacket.OpCode.GET, nextId(), key, null),
-                config.shortTimeoutMs);
-            if (resp.opCode == RemoteDataPacket.OpCode.DATA) return resp.data;
-            return null;
+                    new RemoteDataPacket(RemoteDataPacket.OpCode.GET, nextId(), key, null),
+                    config.shortTimeoutMs);
+            return resp.opCode == RemoteDataPacket.OpCode.DATA ? resp.data : null;
         } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "[RemoteData] GET failed for key: " + key, e);
+            LOGGER.log(Level.WARNING, "[RemoteData] GET failed: " + key, e);
             return null;
+        }
+    }
+
+    public boolean put(String key, byte[] data) {
+        if (!connected) return false;
+        long timeoutMs = key.startsWith("chunk/") ? config.chunkPutTimeoutMs : config.shortTimeoutMs;
+
+        // Deduplicate concurrent PUTs for the same key
+        CompletableFuture<Boolean> mine = new CompletableFuture<>();
+        CompletableFuture<Boolean> existing = inFlightPuts.putIfAbsent(key, mine);
+        if (existing != null) {
+            try { return existing.get(timeoutMs, TimeUnit.MILLISECONDS); }
+            catch (Exception e) { return false; }
+        }
+        try {
+            RemoteDataPacket resp = sendAndWait(
+                    new RemoteDataPacket(RemoteDataPacket.OpCode.PUT, nextId(), key, data),
+                    timeoutMs);
+            boolean ok = resp.opCode == RemoteDataPacket.OpCode.OK;
+            mine.complete(ok);
+            return ok;
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "[RemoteData] PUT failed: " + key, e);
+            mine.complete(false);
+            return false;
+        } finally {
+            inFlightPuts.remove(key, mine);
         }
     }
 
     /**
-     * Store a value on the master.
+     * Send a real-time single-block change to the master.
+     * Master will immediately broadcast a BLOCK_PUSH to all other connected servers.
      *
-     * FIX: chunk/* keys use chunkPutTimeoutMs (default 30 s) instead of
-     * shortTimeoutMs (default 5 s) so large compressed payloads never time out.
+     * key    = "world/x/y/z"
+     * data   = blockStateString bytes (UTF-8), e.g. "minecraft:stone"
      *
-     * FIX: deduplicates concurrent PUTs for the same key using inFlightPuts.
-     * If a virtual thread is already pushing key X, any second caller (flush
-     * thread) will await the first future instead of sending a duplicate packet.
+     * Fire-and-forget on a virtual thread — does not block the calling (main) thread.
      */
-    public boolean put(String key, byte[] data) {
-        if (!connected) return false;
-
-        long timeoutMs = key.startsWith("chunk/") ? config.chunkPutTimeoutMs : config.shortTimeoutMs;
-
-        // ── Deduplication: if a PUT for this key is already in flight, wait for it ──
-        CompletableFuture<Boolean> myFuture  = new CompletableFuture<>();
-        CompletableFuture<Boolean> existing  = inFlightPuts.putIfAbsent(key, myFuture);
-        if (existing != null) {
-            // Another thread is already sending this key — just piggyback on its result.
+    public void sendBlockUpdate(String blockKey, byte[] blockStateBytes) {
+        if (!connected) return;
+        Thread.ofVirtual().name("RemoteData-BlockUpdate-" + blockKey).start(() -> {
             try {
-                return existing.get(timeoutMs, TimeUnit.MILLISECONDS);
+                sendAndWait(
+                        new RemoteDataPacket(RemoteDataPacket.OpCode.BLOCK_UPDATE, nextId(), blockKey, blockStateBytes),
+                        config.shortTimeoutMs);
             } catch (Exception e) {
-                return false;
+                LOGGER.log(Level.FINE, "[RemoteData] BLOCK_UPDATE failed: " + blockKey, e);
             }
-        }
-
-        // We won the race — we are responsible for this PUT.
-        try {
-            RemoteDataPacket resp = sendAndWait(
-                new RemoteDataPacket(RemoteDataPacket.OpCode.PUT, nextId(), key, data),
-                timeoutMs);
-            boolean ok = resp.opCode == RemoteDataPacket.OpCode.OK;
-            myFuture.complete(ok);
-            return ok;
-        } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "[RemoteData] PUT failed for key: " + key, e);
-            myFuture.complete(false);
-            return false;
-        } finally {
-            inFlightPuts.remove(key, myFuture);
-        }
+        });
     }
 
-    /** Delete a key from the master.  Returns true on success. */
     public boolean delete(String key) {
         if (!connected) return false;
         try {
             RemoteDataPacket resp = sendAndWait(
-                new RemoteDataPacket(RemoteDataPacket.OpCode.DELETE, nextId(), key, null),
-                config.shortTimeoutMs);
+                    new RemoteDataPacket(RemoteDataPacket.OpCode.DELETE, nextId(), key, null),
+                    config.shortTimeoutMs);
             return resp.opCode == RemoteDataPacket.OpCode.OK;
         } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "[RemoteData] DELETE failed for key: " + key, e);
+            LOGGER.log(Level.WARNING, "[RemoteData] DELETE failed: " + key, e);
             return false;
         }
     }
 
-    /** Ping the master.  Returns round-trip latency in ms, or -1 on failure. */
     public long ping() {
         if (!connected) return -1;
         try {
-            long t    = System.currentTimeMillis();
+            long t = System.currentTimeMillis();
             RemoteDataPacket resp = sendAndWait(
-                new RemoteDataPacket(RemoteDataPacket.OpCode.PING, nextId(), "", null),
-                config.shortTimeoutMs);
-            if (resp.opCode == RemoteDataPacket.OpCode.PONG) return System.currentTimeMillis() - t;
-        } catch (Exception e) {
-            LOGGER.log(Level.FINE, "[RemoteData] Ping failed", e);
-        }
-        return -1;
+                    new RemoteDataPacket(RemoteDataPacket.OpCode.PING, nextId(), "", null),
+                    config.shortTimeoutMs);
+            return resp.opCode == RemoteDataPacket.OpCode.PONG ? System.currentTimeMillis() - t : -1;
+        } catch (Exception e) { return -1; }
     }
 
     // ── Internal ─────────────────────────────────────────────────────────────
@@ -189,13 +171,6 @@ public class RemoteDataClient {
         return id;
     }
 
-    /**
-     * Write a packet to the wire and block until the matching response arrives,
-     * or until timeoutMs elapses.
-     *
-     * FIX: timeoutMs is now a parameter so callers can supply the right budget
-     * for the operation size (small vs. large chunk payload).
-     */
     private RemoteDataPacket sendAndWait(RemoteDataPacket pkt, long timeoutMs) throws Exception {
         int id = pkt.requestId;
         CompletableFuture<RemoteDataPacket> future = new CompletableFuture<>();
@@ -203,12 +178,12 @@ public class RemoteDataClient {
         try {
             synchronized (dos) {
                 pkt.writeTo(dos, hmac, config.compressionEnabled);
+                dos.flush();
             }
             return future.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
             pending.remove(id);
-            throw new IOException("Request timed out after " + timeoutMs + "ms: "
-                    + pkt.opCode + " key=" + pkt.key);
+            throw new IOException("Timed out after " + timeoutMs + "ms: " + pkt.opCode + " key=" + pkt.key);
         } catch (Exception e) {
             pending.remove(id);
             throw e;
@@ -222,16 +197,19 @@ public class RemoteDataClient {
             while (running && connected) {
                 try {
                     RemoteDataPacket pkt = RemoteDataPacket.readFrom(dis, hmac);
-                    // requestId == 0 → unsolicited server push
+
+                    // requestId == 0 → unsolicited server push (CHUNK_PUSH / BLOCK_PUSH)
+                    // MUST be handled BEFORE the pending lookup — they have no matching request.
                     if (pkt.requestId == 0) {
                         handleServerPush(pkt);
                         continue;
                     }
+
                     CompletableFuture<RemoteDataPacket> future = pending.remove(pkt.requestId);
                     if (future != null) {
                         future.complete(pkt);
                     } else {
-                        LOGGER.fine("[RemoteData] Unsolicited packet with unknown requestId: " + pkt.requestId);
+                        LOGGER.fine("[RemoteData] No pending future for requestId=" + pkt.requestId);
                     }
                 } catch (IOException e) {
                     if (running) {
@@ -247,30 +225,41 @@ public class RemoteDataClient {
     }
 
     /**
-     * Handle an unsolicited packet pushed from the master server.
-     * CHUNK_PUSH: master is broadcasting new chunk data saved by another server.
+     * Handle an unsolicited packet pushed from master.
+     *
+     * BLOCK_PUSH  – apply a single block change immediately on the main thread.
+     *               This is the primary real-time sync path.
+     * CHUNK_PUSH  – update cache and unload chunk so next load picks up fresh data.
+     *               This is the fallback / login-correctness path.
      */
     private void handleServerPush(RemoteDataPacket pkt) {
-        if (pkt.opCode == RemoteDataPacket.OpCode.CHUNK_PUSH) {
-            String key  = pkt.key;
-            byte[] data = pkt.data;
-
-            if (data == null || data.length == 0) {
+        switch (pkt.opCode) {
+            case BLOCK_PUSH -> {
+                // key = "world/x/y/z", data = blockStateString bytes
+                LOGGER.fine("[RemoteData] Received BLOCK_PUSH key=" + pkt.key);
+                try {
+                    RemoteBlockHandler.applyPush(pkt.key, pkt.data);
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING, "[RemoteData] BLOCK_PUSH apply failed for key=" + pkt.key, e);
+                }
+            }
+            case CHUNK_PUSH -> {
+                String key = pkt.key;
+                if (pkt.data == null || pkt.data.length == 0) {
+                    RemoteDataCache cache = RemoteDataCache.get();
+                    if (cache != null) cache.invalidate(key);
+                    return;
+                }
                 RemoteDataCache cache = RemoteDataCache.get();
-                if (cache != null) cache.invalidate(key);
-                LOGGER.fine("[RemoteData] Received CHUNK_PUSH invalidate for key=" + key);
-                return;
+                if (cache != null) cache.putClean(key, pkt.data);
+                try {
+                    RemoteChunkDataHandler.applyPush(key, pkt.data);
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING, "[RemoteData] CHUNK_PUSH apply failed for key=" + key, e);
+                }
+                LOGGER.fine("[RemoteData] Applied CHUNK_PUSH key=" + key + " (" + pkt.data.length + " bytes)");
             }
-
-            RemoteDataCache cache = RemoteDataCache.get();
-            if (cache != null) cache.putClean(key, data);
-
-            try {
-                RemoteChunkDataHandler.applyPush(key, data);
-            } catch (Exception e) {
-                LOGGER.log(Level.WARNING, "[RemoteData] Failed to apply live chunk push for key=" + key, e);
-            }
-            LOGGER.fine("[RemoteData] Applied CHUNK_PUSH key=" + key + " (" + data.length + " bytes)");
+            default -> LOGGER.fine("[RemoteData] Unknown server push opCode=" + pkt.opCode);
         }
     }
 
@@ -284,8 +273,7 @@ public class RemoteDataClient {
                     connectToMaster();
                     backoffMs = 1000;
                 } catch (Exception e) {
-                    LOGGER.warning("[RemoteData] Could not connect to master ("
-                            + e.getMessage() + "). Retrying in " + (backoffMs / 1000) + "s...");
+                    LOGGER.warning("[RemoteData] Could not connect (" + e.getMessage() + "). Retrying in " + (backoffMs/1000) + "s...");
                     try { Thread.sleep(backoffMs); } catch (InterruptedException ie) { break; }
                     backoffMs = Math.min(backoffMs * 2, 30_000);
                 }
@@ -297,66 +285,51 @@ public class RemoteDataClient {
 
     private void connectToMaster() throws IOException {
         closeSocket();
-
-        Socket s;
-        if (config.useTLS) {
-            s = buildTLSSocket();
-        } else {
-            s = new Socket();
-            s.connect(new java.net.InetSocketAddress(config.masterHost, config.masterPort),
-                    config.connectTimeoutMs);
-        }
+        Socket s = config.useTLS ? buildTLSSocket() : new Socket();
+        if (!config.useTLS) s.connect(new java.net.InetSocketAddress(config.masterHost, config.masterPort), config.connectTimeoutMs);
         s.setTcpNoDelay(true);
-        s.setSoTimeout(0);   // no read timeout on the socket itself — we use CompletableFuture timeouts
+        s.setSoTimeout(0);
         s.setKeepAlive(true);
-        // Increase OS send buffer so large chunk payloads don't stall in the kernel
         s.setSendBufferSize(256 * 1024);
         s.setReceiveBufferSize(256 * 1024);
 
         socket = s;
-        dis    = new DataInputStream(new BufferedInputStream(s.getInputStream(),   128 * 1024));
-        dos    = new DataOutputStream(new BufferedOutputStream(s.getOutputStream(), 128 * 1024));
+        dis = new DataInputStream (new BufferedInputStream (s.getInputStream(),  128 * 1024));
+        dos = new DataOutputStream(new BufferedOutputStream(s.getOutputStream(), 128 * 1024));
 
-        // Authenticate
         int authId = nextId();
         CompletableFuture<RemoteDataPacket> authFuture = new CompletableFuture<>();
         pending.put(authId, authFuture);
-
         connected = true;
-        startReader();  // start reader before sending AUTH so we can receive AUTH_OK
+        startReader();
 
-        byte[] keyBytes = config.secretKey.getBytes(java.nio.charset.StandardCharsets.UTF_8);
         RemoteDataPacket authPkt = new RemoteDataPacket(
-                RemoteDataPacket.OpCode.AUTH, authId, "auth", keyBytes);
+                RemoteDataPacket.OpCode.AUTH, authId, "auth",
+                config.secretKey.getBytes(java.nio.charset.StandardCharsets.UTF_8));
         synchronized (dos) {
             authPkt.writeTo(dos, hmac, false);
+            dos.flush();
         }
 
         try {
             RemoteDataPacket authResp = authFuture.get(config.connectTimeoutMs, TimeUnit.MILLISECONDS);
             if (authResp.opCode != RemoteDataPacket.OpCode.AUTH_OK) {
-                connected = false;
-                closeSocket();
+                connected = false; closeSocket();
                 throw new IOException("Authentication rejected by master");
             }
         } catch (TimeoutException e) {
-            connected = false;
-            closeSocket();
+            connected = false; closeSocket();
             throw new IOException("Auth timeout");
         } catch (ExecutionException | InterruptedException e) {
-            connected = false;
-            closeSocket();
+            connected = false; closeSocket();
             throw new IOException("Auth failed: " + e.getMessage());
         }
-
-        LOGGER.info("[RemoteData] Connected and authenticated to master "
-                + config.masterHost + ":" + config.masterPort);
+        LOGGER.info("[RemoteData] Connected and authenticated to master " + config.masterHost + ":" + config.masterPort);
     }
 
     private void handleDisconnect() {
         connected = false;
-        // Complete all waiting futures exceptionally so callers unblock immediately
-        pending.forEach((id, f) -> f.completeExceptionally(new IOException("Disconnected from master")));
+        pending.forEach((id, f) -> f.completeExceptionally(new IOException("Disconnected")));
         pending.clear();
         inFlightPuts.forEach((k, f) -> f.complete(false));
         inFlightPuts.clear();
@@ -365,29 +338,24 @@ public class RemoteDataClient {
 
     private void closeSocket() {
         Socket s = socket;
-        if (s != null && !s.isClosed()) {
-            try { s.close(); } catch (IOException ignored) {}
-        }
-        socket    = null;
+        if (s != null && !s.isClosed()) { try { s.close(); } catch (IOException ignored) {} }
+        socket = null;
         connected = false;
     }
 
     // ── TLS ──────────────────────────────────────────────────────────────────
-
     private Socket buildTLSSocket() throws IOException {
         try {
             KeyStore ks = KeyStore.getInstance("JKS");
             try (FileInputStream fis = new FileInputStream(config.tlsKeystorePath)) {
                 ks.load(fis, config.tlsKeystorePassword.toCharArray());
             }
-            TrustManagerFactory tmf = TrustManagerFactory.getInstance(
-                    TrustManagerFactory.getDefaultAlgorithm());
+            TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
             tmf.init(ks);
             SSLContext ctx = SSLContext.getInstance("TLSv1.3");
             ctx.init(null, tmf.getTrustManagers(), null);
             SSLSocket ss = (SSLSocket) ctx.getSocketFactory().createSocket();
-            ss.connect(new java.net.InetSocketAddress(config.masterHost, config.masterPort),
-                    config.connectTimeoutMs);
+            ss.connect(new java.net.InetSocketAddress(config.masterHost, config.masterPort), config.connectTimeoutMs);
             ss.startHandshake();
             return ss;
         } catch (Exception e) {
