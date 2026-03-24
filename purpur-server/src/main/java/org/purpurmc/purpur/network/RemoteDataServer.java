@@ -10,42 +10,45 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * RemoteDataServer – MASTER server.
+ * RemoteDataServer – MASTER server (v3, master-slave block sync).
  *
- * Handles GET/PUT/DELETE/LIST/BATCH_PUT/PING/CHUNK_INVALIDATE from clients.
+ * Master is the single source of truth for all block changes.
  *
- * Real-time sync (v2):
- *   • BLOCK_UPDATE from Client A  → store nothing, broadcast BLOCK_PUSH to all
- *     other clients immediately. This is the fast path (< 1 ms wire latency).
- *   • PUT chunk/* from Client A   → store in RemoteDataStorage AND broadcast
- *     CHUNK_PUSH to all other clients (fallback / login correctness path).
+ * Block-change flow:
+ *   1. Slave sends BLOCK_ACTION (encoded BlockSyncMessage) to master.
+ *   2. Master applies the change to the real world via RemoteBlockHandler.applyPush().
+ *   3. Master broadcasts BLOCK_PUSH to ALL connected slaves (including sender)
+ *      so every server displays the authoritative state.
  *
- * Each client runs in its own thread from a cached thread pool.
- * Broadcasts use per-client virtual threads so a slow client never blocks others.
+ * Conflict prevention:
+ *   Master tracks the last accepted timestamp per "world/x/y/z" key.
+ *   If an incoming BLOCK_ACTION timestamp <= last accepted, it is ignored.
+ *
+ * Chunk-level sync (PUT/CHUNK_PUSH etc.) is kept for initial load correctness.
  */
 public class RemoteDataServer {
 
     private static final Logger LOGGER = Logger.getLogger("RemoteDataServer");
 
-    // ── Singleton ────────────────────────────────────────────────────────────
+    // ── Singleton ─────────────────────────────────────────────────────────────
     private static RemoteDataServer INSTANCE;
-    public static RemoteDataServer get()  { return INSTANCE; }
-    public static RemoteDataServer init(RemoteDataConfig cfg, File serverRoot) {
-        INSTANCE = new RemoteDataServer(cfg, serverRoot);
-        return INSTANCE;
-    }
+    public static RemoteDataServer get()                                      { return INSTANCE; }
+    public static RemoteDataServer init(RemoteDataConfig config, File root)   { INSTANCE = new RemoteDataServer(config, root); return INSTANCE; }
 
-    // ── Fields ───────────────────────────────────────────────────────────────
-    private final RemoteDataConfig  config;
-    private final HmacHelper        hmac;
+    // ── Fields ────────────────────────────────────────────────────────────────
+    private final RemoteDataConfig config;
+    private final HmacHelper       hmac;
     private final RemoteDataStorage storage;
 
     private ServerSocket serverSocket;
     private volatile boolean running = false;
     private Thread acceptThread;
 
-    /** All currently-authenticated client handlers, keyed by remote address */
+    /** Connected, authenticated slave handlers keyed by remote address string. */
     private final ConcurrentHashMap<String, ClientHandler> clients = new ConcurrentHashMap<>();
+
+    /** Conflict guard: "world/x/y/z" → last accepted timestamp. */
+    private final ConcurrentHashMap<String, Long> lastBlockTimestamp = new ConcurrentHashMap<>();
 
     private final ExecutorService clientPool = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "RemoteData-ClientHandler");
@@ -53,7 +56,7 @@ public class RemoteDataServer {
         return t;
     });
 
-    // ── Constructor ──────────────────────────────────────────────────────────
+    // ── Constructor ───────────────────────────────────────────────────────────
     private RemoteDataServer(RemoteDataConfig config, File serverRoot) {
         this.config  = config;
         this.hmac    = new HmacHelper(config.secretKey);
@@ -62,7 +65,7 @@ public class RemoteDataServer {
 
     public RemoteDataStorage getStorage() { return storage; }
 
-    // ── Lifecycle ────────────────────────────────────────────────────────────
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
     public void start() throws IOException {
         if (config.useTLS) {
             serverSocket = buildTLSServerSocket();
@@ -71,7 +74,7 @@ public class RemoteDataServer {
             serverSocket.setReuseAddress(true);
             serverSocket.bind(new InetSocketAddress(config.masterPort));
         }
-        running = true;
+        running      = true;
         acceptThread = new Thread(this::acceptLoop, "RemoteData-Accept");
         acceptThread.setDaemon(true);
         acceptThread.start();
@@ -88,7 +91,7 @@ public class RemoteDataServer {
         LOGGER.info("[RemoteData] Master server stopped.");
     }
 
-    // ── Accept loop ──────────────────────────────────────────────────────────
+    // ── Accept loop ───────────────────────────────────────────────────────────
     private void acceptLoop() {
         while (running) {
             try {
@@ -104,52 +107,46 @@ public class RemoteDataServer {
         }
     }
 
-    // ── Broadcast helpers ────────────────────────────────────────────────────
+    // ── Broadcast helpers ─────────────────────────────────────────────────────
 
     /**
-     * Broadcast a BLOCK_PUSH to all authenticated clients except the sender.
-     * Each client gets its own virtual thread so a slow client never blocks others.
+     * Broadcast BLOCK_PUSH to ALL authenticated slaves (including sender).
+     * Each gets its own virtual thread so a slow client never blocks others.
      */
-    private void broadcastBlockPush(String senderClientId, String blockKey, byte[] blockData) {
-        RemoteDataPacket pkt = new RemoteDataPacket(RemoteDataPacket.OpCode.BLOCK_PUSH, 0, blockKey, blockData);
-        for (var entry : clients.entrySet()) {
-            if (entry.getKey().equals(senderClientId)) continue;
-            ClientHandler target = entry.getValue();
-            if (!target.authenticated) continue;
-            Thread.ofVirtual().name("RemoteData-BlockPush-" + entry.getKey()).start(() -> {
-                try {
-                    target.sendPacket(pkt);
-                } catch (IOException e) {
-                    LOGGER.fine("[RemoteData] BLOCK_PUSH to " + entry.getKey() + " failed: " + e.getMessage());
-                }
-            });
+    private void broadcastBlockPush(BlockSyncMessage msg) {
+        byte[] encoded;
+        try { encoded = msg.encode(); } catch (IOException e) {
+            LOGGER.warning("[RemoteData] broadcastBlockPush encode failed: " + e.getMessage());
+            return;
         }
+        RemoteDataPacket pkt = new RemoteDataPacket(RemoteDataPacket.OpCode.BLOCK_PUSH, 0, "", encoded);
+        int sent = 0;
+        for (ClientHandler target : clients.values()) {
+            if (!target.authenticated) continue;
+            Thread.ofVirtual().name("RemoteData-BlockPush").start(() -> {
+                try { target.sendPacket(pkt); }
+                catch (IOException e) { LOGGER.fine("[RemoteData] BLOCK_PUSH send failed: " + e.getMessage()); }
+            });
+            sent++;
+        }
+        LOGGER.fine("[RemoteData] Broadcast BLOCK_PUSH pos=" + msg.posKey() + " to " + sent + " slave(s)");
     }
 
-    /**
-     * Broadcast a CHUNK_PUSH to all authenticated clients except the sender.
-     * Each client gets its own virtual thread.
-     */
+    /** Broadcast CHUNK_PUSH to all slaves except sender. */
     private void broadcastChunkPush(String senderClientId, String chunkKey, byte[] chunkData) {
         RemoteDataPacket pkt = new RemoteDataPacket(RemoteDataPacket.OpCode.CHUNK_PUSH, 0, chunkKey, chunkData);
-        int sent = 0;
         for (var entry : clients.entrySet()) {
             if (entry.getKey().equals(senderClientId)) continue;
             ClientHandler target = entry.getValue();
             if (!target.authenticated) continue;
             Thread.ofVirtual().name("RemoteData-ChunkPush-" + entry.getKey()).start(() -> {
-                try {
-                    target.sendPacket(pkt);
-                } catch (IOException e) {
-                    LOGGER.warning("[RemoteData] CHUNK_PUSH to " + entry.getKey() + " failed: " + e.getMessage());
-                }
+                try { target.sendPacket(pkt); }
+                catch (IOException e) { LOGGER.warning("[RemoteData] CHUNK_PUSH to " + entry.getKey() + " failed: " + e.getMessage()); }
             });
-            sent++;
         }
-        if (sent > 0) LOGGER.fine("[RemoteData] Broadcast CHUNK_PUSH key=" + chunkKey + " to " + sent + " client(s)");
     }
 
-    // ── Client handler ───────────────────────────────────────────────────────
+    // ── Client handler ────────────────────────────────────────────────────────
     private class ClientHandler implements Runnable {
         private final Socket socket;
         private DataInputStream  dis;
@@ -168,29 +165,30 @@ public class RemoteDataServer {
             try {
                 dis = new DataInputStream (new BufferedInputStream (socket.getInputStream(),  65536));
                 dos = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 65536));
-                LOGGER.info("[RemoteData] Client connected: " + id);
+                LOGGER.info("[RemoteData] Slave connected: " + id);
                 while (running && !socket.isClosed()) handlePacket();
             } catch (EOFException | SocketException e) {
                 // normal disconnect
             } catch (IOException e) {
-                if (running) LOGGER.log(Level.WARNING, "[RemoteData] Error with client " + id, e);
+                if (running) LOGGER.log(Level.WARNING, "[RemoteData] Error with slave " + id, e);
             } finally {
                 clients.remove(id);
                 close();
-                LOGGER.info("[RemoteData] Client disconnected: " + id);
+                LOGGER.info("[RemoteData] Slave disconnected: " + id);
             }
         }
 
         private void handlePacket() throws IOException {
             RemoteDataPacket pkt = RemoteDataPacket.readFrom(dis, hmac);
 
+            // ── Auth gate ─────────────────────────────────────────────────────
             if (!authenticated) {
                 if (pkt.opCode == RemoteDataPacket.OpCode.AUTH) {
                     String supplied = new String(pkt.data, java.nio.charset.StandardCharsets.UTF_8);
                     if (config.secretKey.equals(supplied)) {
                         authenticated = true;
                         sendResponse(RemoteDataPacket.OpCode.AUTH_OK, pkt.requestId, "auth", "OK".getBytes());
-                        LOGGER.info("[RemoteData] Client authenticated: " + id);
+                        LOGGER.info("[RemoteData] Slave authenticated: " + id);
                     } else {
                         sendResponse(RemoteDataPacket.OpCode.AUTH_FAIL, pkt.requestId, "auth", "FAIL".getBytes());
                         close();
@@ -202,33 +200,52 @@ public class RemoteDataServer {
                 return;
             }
 
+            // ── Dispatch ──────────────────────────────────────────────────────
             switch (pkt.opCode) {
+
                 case PING -> sendResponse(RemoteDataPacket.OpCode.PONG, pkt.requestId, "", new byte[0]);
 
+                // ── Block action: slave → master (THE primary path) ───────────
+                case BLOCK_ACTION -> {
+                    sendResponse(RemoteDataPacket.OpCode.OK, pkt.requestId, "", new byte[0]);
+                    try {
+                        BlockSyncMessage msg = BlockSyncMessage.decode(pkt.data);
+                        String posKey = msg.posKey();
+
+                        // Conflict guard: reject stale messages
+                        long prev = lastBlockTimestamp.getOrDefault(posKey, Long.MIN_VALUE);
+                        if (msg.timestamp <= prev) {
+                            LOGGER.fine("[RemoteData] BLOCK_ACTION rejected (stale ts=" + msg.timestamp
+                                    + " <= " + prev + ") pos=" + posKey);
+                            return;
+                        }
+                        lastBlockTimestamp.put(posKey, msg.timestamp);
+
+                        LOGGER.fine("[RemoteData] BLOCK_ACTION accepted pos=" + posKey
+                                + " action=" + msg.action + " block=" + msg.blockData);
+
+                        // Apply to master's world (the source of truth)
+                        RemoteBlockHandler.applyPush(msg);
+
+                        // Broadcast authoritative state to all slaves
+                        broadcastBlockPush(msg);
+
+                    } catch (Exception e) {
+                        LOGGER.log(Level.WARNING, "[RemoteData] BLOCK_ACTION decode/apply failed", e);
+                    }
+                }
+
+                // ── Chunk-level ops (kept for initial load correctness) ────────
                 case GET -> {
                     byte[] data = storage.get(pkt.key);
                     if (data != null) sendResponse(RemoteDataPacket.OpCode.DATA,      pkt.requestId, pkt.key, data);
-                    else              sendResponse(RemoteDataPacket.OpCode.NOT_FOUND, pkt.requestId, pkt.key, new byte[0]);
+                    else              sendResponse(RemoteDataPacket.OpCode.NOT_FOUND,  pkt.requestId, pkt.key, new byte[0]);
                 }
 
                 case PUT -> {
                     storage.put(pkt.key, pkt.data);
                     sendResponse(RemoteDataPacket.OpCode.OK, pkt.requestId, pkt.key, new byte[0]);
-                    LOGGER.info("[RemoteData] PUT " + pkt.key);
-                    // chunk-level sync: broadcast full chunk so Server B has correct
-                    // data for players who load this chunk later
-                    if (pkt.key.startsWith("chunk/")) {
-                        broadcastChunkPush(id, pkt.key, pkt.data);
-                    }
-                }
-
-                case BLOCK_UPDATE -> {
-                    // Fast path: don't store, just broadcast to all other clients immediately.
-                    // key   = "world/x/y/z"
-                    // data  = blockStateString bytes (UTF-8)
-                    sendResponse(RemoteDataPacket.OpCode.OK, pkt.requestId, pkt.key, new byte[0]);
-                    LOGGER.fine("[RemoteData] BLOCK_UPDATE " + pkt.key);
-                    broadcastBlockPush(id, pkt.key, pkt.data);
+                    if (pkt.key.startsWith("chunk/")) broadcastChunkPush(id, pkt.key, pkt.data);
                 }
 
                 case DELETE -> {
@@ -237,8 +254,8 @@ public class RemoteDataServer {
                 }
 
                 case LIST -> {
-                    String[] keys = storage.list(pkt.key);
-                    byte[] result = String.join("\n", keys).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    String[] keys  = storage.list(pkt.key);
+                    byte[]   result = String.join("\n", keys).getBytes(java.nio.charset.StandardCharsets.UTF_8);
                     sendResponse(RemoteDataPacket.OpCode.LIST_RESULT, pkt.requestId, pkt.key, result);
                 }
 
@@ -265,7 +282,7 @@ public class RemoteDataServer {
                 int    kLen = batch.readShort() & 0xFFFF;
                 byte[] kb   = new byte[kLen];
                 batch.readFully(kb);
-                String key = new String(kb, java.nio.charset.StandardCharsets.UTF_8);
+                String key  = new String(kb, java.nio.charset.StandardCharsets.UTF_8);
                 int    dLen = batch.readInt();
                 byte[] data = new byte[dLen];
                 batch.readFully(data);
@@ -290,7 +307,7 @@ public class RemoteDataServer {
         }
     }
 
-    // ── TLS ──────────────────────────────────────────────────────────────────
+    // ── TLS ───────────────────────────────────────────────────────────────────
     private ServerSocket buildTLSServerSocket() throws IOException {
         try {
             KeyStore ks = KeyStore.getInstance("JKS");

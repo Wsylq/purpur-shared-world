@@ -9,22 +9,33 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * RemoteDataConfig — UNCHANGED
+ * RemoteDataConfig – v3 (master-slave block sync)
  *
- * Two separate timeouts:
- *   shortTimeoutMs    – PING / GET / DELETE / AUTH  (default 5 000 ms)
- *   chunkPutTimeoutMs – PUT of chunk/* keys         (default 30 000 ms)
+ * New field: worldOwner (true = this server is Master / World Owner)
+ *
+ * remote-data.yml example:
+ *
+ *   remote-data:
+ *     enabled: true
+ *     mode: master          # "master" or "slave"
+ *     world-owner: true     # true on Master only; slaves set this to false
+ *     master-host: 127.0.0.1
+ *     master-port: 25580
+ *     secret-key: CHANGE_ME
  */
 public class RemoteDataConfig {
 
     private static final Logger LOGGER = Logger.getLogger("RemoteDataConfig");
 
     private static RemoteDataConfig INSTANCE;
-    public static RemoteDataConfig get()                    { return INSTANCE; }
-    public static RemoteDataConfig init(File serverRoot)    { INSTANCE = new RemoteDataConfig(serverRoot); return INSTANCE; }
+    public static RemoteDataConfig get()                 { return INSTANCE; }
+    public static RemoteDataConfig init(File serverRoot) { INSTANCE = new RemoteDataConfig(serverRoot); return INSTANCE; }
 
     public final boolean enabled;
-    public final boolean isMaster;
+    public final boolean isMaster;      // true  → run RemoteDataServer (TCP listener)
+    public final boolean isWorldOwner;  // true  → this server owns the world files (writes allowed)
+                                        // false → read-only; cancel local block events, forward to master
+
     public final String  masterHost;
     public final int     masterPort;
     public final String  secretKey;
@@ -56,9 +67,12 @@ public class RemoteDataConfig {
             LOGGER.warning("[RemoteData] remote-data.yml not found – remote data system disabled.");
         }
 
-        enabled    = cfg.getBoolean("remote-data.enabled", false);
-        String mode = cfg.getString("remote-data.mode", "client");
-        isMaster   = "master".equalsIgnoreCase(mode);
+        enabled      = cfg.getBoolean("remote-data.enabled", false);
+        String mode  = cfg.getString("remote-data.mode", "slave");
+        isMaster     = "master".equalsIgnoreCase(mode);
+        // world-owner defaults to true only when mode=master, so a simple upgrade works
+        isWorldOwner = cfg.getBoolean("remote-data.world-owner", isMaster);
+
         masterHost = cfg.getString("remote-data.master-host", "127.0.0.1");
         masterPort = cfg.getInt   ("remote-data.master-port", 25580);
         secretKey  = cfg.getString("remote-data.secret-key",  "CHANGE_ME");
@@ -84,7 +98,8 @@ public class RemoteDataConfig {
         if (!configFile.exists()) writeDefaults(configFile, cfg);
 
         if (enabled) {
-            LOGGER.info("[RemoteData] Mode: " + (isMaster ? "MASTER" : "CLIENT")
+            LOGGER.info("[RemoteData] Mode: " + (isMaster ? "MASTER" : "SLAVE")
+                    + " | WorldOwner: " + isWorldOwner
                     + " | Host: " + masterHost + ":" + masterPort
                     + " | TLS: " + useTLS
                     + " | Compression: " + compressionEnabled
@@ -95,7 +110,8 @@ public class RemoteDataConfig {
 
     private void writeDefaults(File configFile, YamlConfiguration cfg) {
         cfg.set("remote-data.enabled",                               false);
-        cfg.set("remote-data.mode",                                  "client");
+        cfg.set("remote-data.mode",                                  "slave");
+        cfg.set("remote-data.world-owner",                           false);
         cfg.set("remote-data.master-host",                           "127.0.0.1");
         cfg.set("remote-data.master-port",                           25580);
         cfg.set("remote-data.secret-key",                            "CHANGE_ME");

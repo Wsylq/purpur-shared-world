@@ -11,154 +11,140 @@ import org.bukkit.event.player.PlayerBucketEmptyEvent;
 import org.bukkit.event.player.PlayerBucketFillEvent;
 import org.bukkit.event.world.StructureGrowEvent;
 
-import java.util.List;
-
 /**
- * RemoteBlockListener – Bukkit event listener for real-time block sync.
+ * RemoteBlockListener – Bukkit event listener (v3, master-slave).
  *
- * This is registered in RemoteDataManager.init() when mode=CLIENT.
- * It listens to every event that changes a block's state and sends
- * a BLOCK_UPDATE to master via RemoteBlockHandler.sendPush().
+ * SLAVE mode (isWorldOwner = false):
+ *   • Cancels all block-changing events at LOWEST priority.
+ *   • At MONITOR priority it forwards the intended change to master via
+ *     RemoteBlockHandler.sendAction().
+ *   • Master applies & broadcasts the authoritative state back.
  *
- * IMPORTANT: All handlers run at MONITOR priority with ignoreCancelled=true
- * so we only sync blocks that were actually changed (not cancelled by other plugins).
+ * MASTER mode (isWorldOwner = true):
+ *   • Does NOT cancel events — the master's world is the source of truth.
+ *   • At MONITOR priority it broadcasts the resulting block state to all slaves
+ *     via RemoteBlockHandler's broadcastBlockPush path (through RemoteDataServer).
+ *   • This is registered only in CLIENT (slave) mode by RemoteDataManager.
+ *     On master the events naturally run and chunk-save keeps storage in sync.
  *
- * Events covered:
- *   BlockPlaceEvent          – player places a block
- *   BlockBreakEvent          – player breaks a block
- *   BlockBurnEvent           – fire burns a block
- *   BlockFadeEvent           – snow/ice/coral fading
- *   BlockFormEvent           – snow forming, obsidian forming
- *   BlockGrowEvent           – crops/vines growing
- *   BlockSpreadEvent         – fire spreading, mycelium spreading
- *   BlockExplodeEvent        – TNT/creeper explosion block changes
- *   EntityExplodeEvent       – entity explosion (creeper, etc.)
- *   EntityChangeBlockEvent   – enderman picking/placing, falling sand landing
- *   PlayerBucketEmptyEvent   – placing water/lava
- *   PlayerBucketFillEvent    – picking up water/lava (sets AIR)
- *   StructureGrowEvent       – trees, mushrooms, etc. growing
- *   SignChangeEvent          – sign text changes
- *
- * NOTE: We do NOT cancel or interfere with any events.
- * We only read the final state AFTER the event has been processed.
+ * Registration:
+ *   RemoteDataManager.init() registers this listener only on SLAVE servers.
+ *   Master servers do not need it — their block changes are applied locally
+ *   and then broadcast by RemoteDataServer after receiving BLOCK_ACTION.
  */
 public class RemoteBlockListener implements Listener {
 
-    // ── Player block interactions ─────────────────────────────────────────────
+    // ── Cancel events on slave BEFORE they touch the world ───────────────────
+    // LOWEST priority runs first — we cancel here so the world is never mutated.
 
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockPlace(BlockPlaceEvent event) {
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void cancelBlockPlace(BlockPlaceEvent event) {
+        if (!isSlaveMode()) return;
+        event.setCancelled(true);
+        // Forward intent to master
         Block b = event.getBlock();
-        RemoteBlockHandler.sendPush(b.getWorld(), b.getX(), b.getY(), b.getZ(), b);
+        RemoteBlockHandler.sendAction(b.getWorld(), b.getX(), b.getY(), b.getZ(),
+                BlockSyncMessage.ACTION_PLACE, b);
     }
 
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockBreak(BlockBreakEvent event) {
-        // After break, the block becomes AIR — sendPush reads the block's new state
-        // BUT: at MONITOR priority, the block in the world is already changed to AIR.
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void cancelBlockBreak(BlockBreakEvent event) {
+        if (!isSlaveMode()) return;
+        event.setCancelled(true);
         Block b = event.getBlock();
-        RemoteBlockHandler.sendPush(b.getWorld(), b.getX(), b.getY(), b.getZ(), b);
+        RemoteBlockHandler.sendAction(b.getWorld(), b.getX(), b.getY(), b.getZ(),
+                BlockSyncMessage.ACTION_BREAK, b);
     }
 
-    // ── Bucket use ───────────────────────────────────────────────────────────
-
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBucketEmpty(PlayerBucketEmptyEvent event) {
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void cancelBucketEmpty(PlayerBucketEmptyEvent event) {
+        if (!isSlaveMode()) return;
+        event.setCancelled(true);
         Block b = event.getBlock();
-        RemoteBlockHandler.sendPush(b.getWorld(), b.getX(), b.getY(), b.getZ(), b);
+        RemoteBlockHandler.sendAction(b.getWorld(), b.getX(), b.getY(), b.getZ(),
+                BlockSyncMessage.ACTION_PLACE, b);
     }
 
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBucketFill(PlayerBucketFillEvent event) {
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void cancelBucketFill(PlayerBucketFillEvent event) {
+        if (!isSlaveMode()) return;
+        event.setCancelled(true);
         Block b = event.getBlock();
-        RemoteBlockHandler.sendPush(b.getWorld(), b.getX(), b.getY(), b.getZ(), b);
+        RemoteBlockHandler.sendAction(b.getWorld(), b.getX(), b.getY(), b.getZ(),
+                BlockSyncMessage.ACTION_BREAK, b);
     }
 
-    // ── Natural block changes ─────────────────────────────────────────────────
-
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockBurn(BlockBurnEvent event) {
-        Block b = event.getBlock();
-        RemoteBlockHandler.sendPush(b.getWorld(), b.getX(), b.getY(), b.getZ(), b);
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void cancelBlockBurn(BlockBurnEvent event) {
+        if (!isSlaveMode()) return;
+        event.setCancelled(true);
     }
 
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockFade(BlockFadeEvent event) {
-        Block b = event.getBlock();
-        RemoteBlockHandler.sendPush(b.getWorld(), b.getX(), b.getY(), b.getZ(), b);
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void cancelBlockFade(BlockFadeEvent event) {
+        if (!isSlaveMode()) return;
+        event.setCancelled(true);
     }
 
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockForm(BlockFormEvent event) {
-        Block b = event.getBlock();
-        RemoteBlockHandler.sendPush(b.getWorld(), b.getX(), b.getY(), b.getZ(), b);
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void cancelBlockForm(BlockFormEvent event) {
+        if (!isSlaveMode()) return;
+        event.setCancelled(true);
     }
 
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockGrow(BlockGrowEvent event) {
-        Block b = event.getBlock();
-        RemoteBlockHandler.sendPush(b.getWorld(), b.getX(), b.getY(), b.getZ(), b);
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void cancelBlockGrow(BlockGrowEvent event) {
+        if (!isSlaveMode()) return;
+        event.setCancelled(true);
     }
 
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockSpread(BlockSpreadEvent event) {
-        Block b = event.getBlock();
-        RemoteBlockHandler.sendPush(b.getWorld(), b.getX(), b.getY(), b.getZ(), b);
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void cancelBlockSpread(BlockSpreadEvent event) {
+        if (!isSlaveMode()) return;
+        event.setCancelled(true);
     }
 
-    // ── Explosions ────────────────────────────────────────────────────────────
-
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockExplode(BlockExplodeEvent event) {
-        for (Block b : event.blockList()) {
-            RemoteBlockHandler.sendPush(b.getWorld(), b.getX(), b.getY(), b.getZ(), b);
-        }
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void cancelBlockExplode(BlockExplodeEvent event) {
+        if (!isSlaveMode()) return;
+        event.setCancelled(true);
     }
 
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onEntityExplode(EntityExplodeEvent event) {
-        for (Block b : event.blockList()) {
-            RemoteBlockHandler.sendPush(b.getWorld(), b.getX(), b.getY(), b.getZ(), b);
-        }
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void cancelEntityExplode(EntityExplodeEvent event) {
+        if (!isSlaveMode()) return;
+        // Don't cancel entity explosion itself, but clear the block list
+        event.blockList().clear();
     }
 
-    // ── Entity block changes ──────────────────────────────────────────────────
-
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onEntityChangeBlock(EntityChangeBlockEvent event) {
-        Block b = event.getBlock();
-        RemoteBlockHandler.sendPush(b.getWorld(), b.getX(), b.getY(), b.getZ(), b);
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void cancelEntityChangeBlock(EntityChangeBlockEvent event) {
+        if (!isSlaveMode()) return;
+        event.setCancelled(true);
     }
 
-    // ── Structure growth (trees, mushrooms, bamboo) ───────────────────────────
-
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onStructureGrow(StructureGrowEvent event) {
-        for (var state : event.getBlocks()) {
-            Block b = state.getBlock();
-            RemoteBlockHandler.sendPush(b.getWorld(), b.getX(), b.getY(), b.getZ(), b);
-        }
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void cancelStructureGrow(StructureGrowEvent event) {
+        if (!isSlaveMode()) return;
+        event.setCancelled(true);
     }
 
-    // ── Piston ───────────────────────────────────────────────────────────────
-
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockPiston(BlockPistonExtendEvent event) {
-        // Piston head
-        Block piston = event.getBlock();
-        RemoteBlockHandler.sendPush(piston.getWorld(), piston.getX(), piston.getY(), piston.getZ(), piston);
-        // Moved blocks
-        for (Block b : event.getBlocks()) {
-            RemoteBlockHandler.sendPush(b.getWorld(), b.getX(), b.getY(), b.getZ(), b);
-        }
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void cancelPistonExtend(BlockPistonExtendEvent event) {
+        if (!isSlaveMode()) return;
+        event.setCancelled(true);
     }
 
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockPistonRetract(BlockPistonRetractEvent event) {
-        Block piston = event.getBlock();
-        RemoteBlockHandler.sendPush(piston.getWorld(), piston.getX(), piston.getY(), piston.getZ(), piston);
-        for (Block b : event.getBlocks()) {
-            RemoteBlockHandler.sendPush(b.getWorld(), b.getX(), b.getY(), b.getZ(), b);
-        }
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void cancelPistonRetract(BlockPistonRetractEvent event) {
+        if (!isSlaveMode()) return;
+        event.setCancelled(true);
+    }
+
+    // ── Helper ────────────────────────────────────────────────────────────────
+
+    private static boolean isSlaveMode() {
+        RemoteDataConfig cfg = RemoteDataConfig.get();
+        return cfg != null && cfg.enabled && !cfg.isWorldOwner;
     }
 }

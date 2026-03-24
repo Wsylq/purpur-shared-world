@@ -6,7 +6,7 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
 /**
- * RemoteDataPacket – binary protocol
+ * RemoteDataPacket – binary protocol (v3, master-slave block sync)
  *
  * Wire format (all big-endian):
  *   [4 bytes] magic       = 0x52444154 ('RDAT')
@@ -19,9 +19,12 @@ import java.util.zip.GZIPOutputStream;
  *   [M bytes] data
  *   [32 bytes] HMAC-SHA256
  *
- * Added in v2:
- *   BLOCK_UPDATE  – carries a single block change: key="world/x/y/z", data=blockStateString UTF-8
- *   BLOCK_PUSH    – master → clients: same layout as BLOCK_UPDATE (requestId=0)
+ * OpCodes:
+ *   BLOCK_ACTION  (0x17) – slave → master: encoded BlockSyncMessage
+ *   BLOCK_PUSH    (0x96) – master → slaves: encoded BlockSyncMessage (requestId=0)
+ *
+ * Chunk-level ops (PUT/GET/etc.) are retained for initial world load correctness
+ * but block-level sync is the primary real-time path.
  */
 public class RemoteDataPacket {
 
@@ -39,7 +42,7 @@ public class RemoteDataPacket {
         BATCH_PUT        (0x14),
         CHUNK_INVALIDATE (0x15),
         CHUNK_PUSH_ACK   (0x16),
-        BLOCK_UPDATE     (0x17),   // NEW: real-time single block change
+        BLOCK_ACTION     (0x17),   // slave sends a block place/break to master
 
         // Master → Client
         PONG             (0x81),
@@ -51,7 +54,7 @@ public class RemoteDataPacket {
         ERROR            (0x93),
         LIST_RESULT      (0x94),
         CHUNK_PUSH       (0x95),
-        BLOCK_PUSH       (0x96);  // NEW: master broadcasts block change to all other clients
+        BLOCK_PUSH       (0x96);  // master broadcasts applied block state to all slaves
 
         public final byte code;
         OpCode(int code) { this.code = (byte) code; }
@@ -71,10 +74,10 @@ public class RemoteDataPacket {
     public final boolean wasCompressed;
 
     public RemoteDataPacket(OpCode opCode, int requestId, String key, byte[] data) {
-        this.opCode       = opCode;
-        this.requestId    = requestId;
-        this.key          = key  != null ? key  : "";
-        this.data         = data != null ? data : new byte[0];
+        this.opCode        = opCode;
+        this.requestId     = requestId;
+        this.key           = key  != null ? key  : "";
+        this.data          = data != null ? data : new byte[0];
         this.wasCompressed = false;
     }
 
@@ -83,7 +86,7 @@ public class RemoteDataPacket {
         this.data = data; this.wasCompressed = compressed;
     }
 
-    // ── Serialisation ────────────────────────────────────────────────────────
+    // ── Serialisation ─────────────────────────────────────────────────────────
 
     public void writeTo(DataOutputStream out, HmacHelper hmac, boolean compress) throws IOException {
         byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
@@ -147,14 +150,14 @@ public class RemoteDataPacket {
         return new RemoteDataPacket(op, id, new String(keyBytes, StandardCharsets.UTF_8), payload, compressed);
     }
 
-    // ── helpers ──────────────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static int   readIntRaw  (DataInputStream in, DataOutputStream r) throws IOException { int   v=in.readInt();   r.writeInt(v);   return v; }
     private static byte  readByteRaw (DataInputStream in, DataOutputStream r) throws IOException { byte  v=in.readByte();  r.writeByte(v);  return v; }
     private static short readShortRaw(DataInputStream in, DataOutputStream r) throws IOException { short v=in.readShort(); r.writeShort(v); return v; }
 
     private static byte[] gzip(byte[] d) throws IOException {
-        ByteArrayOutputStream b = new ByteArrayOutputStream(d.length/2);
+        ByteArrayOutputStream b = new ByteArrayOutputStream(d.length / 2);
         try (GZIPOutputStream g = new GZIPOutputStream(b)) { g.write(d); }
         return b.toByteArray();
     }
