@@ -7,17 +7,17 @@ import java.nio.charset.StandardCharsets;
  * Lightweight binary block-change message.
  *
  * Wire format (big-endian):
- *   [1 byte ] action     0x01=place, 0x02=break
+ *   [1 byte ] action       0x01=place, 0x02=break
  *   [4 bytes] x
  *   [4 bytes] y
  *   [4 bytes] z
- *   [8 bytes] timestamp  System.currentTimeMillis()
+ *   [8 bytes] timestamp    System.currentTimeMillis()
  *   [2 bytes] blockDataLength
- *   [N bytes] blockData  UTF-8 blockstate string, e.g. "minecraft:stone"
+ *   [N bytes] blockData    UTF-8 blockstate string, e.g. "minecraft:stone[waterlogged=false]"
  *   [2 bytes] worldNameLength
- *   [M bytes] worldName  UTF-8
+ *   [M bytes] worldName    UTF-8
  *
- * Total ~30–60 bytes per block change.
+ * Total ~30–80 bytes per block change.
  */
 public final class BlockSyncMessage {
 
@@ -29,7 +29,7 @@ public final class BlockSyncMessage {
     public final int    y;
     public final int    z;
     public final long   timestamp;
-    public final String blockData;   // e.g. "minecraft:oak_log[axis=y]"
+    public final String blockData;   // full blockstate string, e.g. "minecraft:oak_log[axis=y]"
     public final String worldName;
 
     public BlockSyncMessage(byte action, int x, int y, int z, long timestamp,
@@ -39,15 +39,15 @@ public final class BlockSyncMessage {
         this.y         = y;
         this.z         = z;
         this.timestamp = timestamp;
-        this.blockData = blockData;
-        this.worldName = worldName;
+        this.blockData = (blockData != null) ? blockData : "minecraft:air";
+        this.worldName = (worldName != null) ? worldName : "world";
     }
 
     // ── Encode ────────────────────────────────────────────────────────────────
 
     public byte[] encode() throws IOException {
-        byte[] bdBytes  = blockData.getBytes(StandardCharsets.UTF_8);
-        byte[] wnBytes  = worldName.getBytes(StandardCharsets.UTF_8);
+        byte[] bdBytes = blockData.getBytes(StandardCharsets.UTF_8);
+        byte[] wnBytes = worldName.getBytes(StandardCharsets.UTF_8);
         ByteArrayOutputStream bos = new ByteArrayOutputStream(32 + bdBytes.length + wnBytes.length);
         DataOutputStream dos = new DataOutputStream(bos);
         dos.writeByte(action);
@@ -83,8 +83,14 @@ public final class BlockSyncMessage {
         return new BlockSyncMessage(action, x, y, z, timestamp, blockData, worldName);
     }
 
-    /** Convenience key used in conflict maps: "world/x/y/z" */
+    /** Convenience key used in conflict maps and logs: "worldName/x/y/z" */
     public String posKey() {
         return worldName + "/" + x + "/" + y + "/" + z;
+    }
+
+    @Override
+    public String toString() {
+        return "BlockSyncMessage{action=" + (action == ACTION_PLACE ? "PLACE" : "BREAK")
+                + ", pos=" + posKey() + ", block=" + blockData + ", ts=" + timestamp + "}";
     }
 }

@@ -1,0 +1,37 @@
+remote-data:
+  # Set to true to activate the sync system
+  enabled: true
+
+  # "master" = this server owns the world and receives block actions from slaves
+  mode: master
+
+  # true = this server reads AND writes world files (the ground truth)
+  world-owner: true
+
+  # The IP/hostname master listens on. 0.0.0.0 = all interfaces
+  master-host: 0.0.0.0
+
+  # TCP port master listens on. Open this in your firewall.
+  master-port: 26668
+
+  # Shared secret. Must be IDENTICAL on master and ALL slaves.
+  # Change this before deploying!
+  secret-key: reyansh
+
+  # TLS (optional, recommended for production over public networks)
+  use-tls: false
+  tls-keystore-path: keystore.jks
+  tls-keystore-password: changeit
+
+  cache:
+    max-chunk-entries: 4096
+    dirty-flush-interval-ticks: 100
+    wal-enabled: true
+    wal-path: remote-wal.log
+
+  sync:
+    batch-size: 32
+    compression-enabled: true
+    connect-timeout-ms: 5000
+    short-timeout-ms: 5000
+    chunk-put-timeout-ms: 30000

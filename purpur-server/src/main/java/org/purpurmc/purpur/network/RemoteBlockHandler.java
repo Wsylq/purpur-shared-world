@@ -2,6 +2,7 @@ package org.purpurmc.purpur.network;
 
 import net.minecraft.server.MinecraftServer;
 import org.bukkit.Bukkit;
+import org.bukkit.Chunk;
 import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.block.Block;
@@ -12,21 +13,17 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * RemoteBlockHandler – real-time single-block sync (v3).
+ * RemoteBlockHandler – real-time single-block sync (v4, fixed).
  *
- * MASTER mode:
- *   applyPush(BlockSyncMessage) – applies an incoming block action to master's world.
- *   Called from RemoteDataServer after conflict-guard passes.
+ * SLAVE sendAction():
+ *   Called from RemoteBlockListener on slave servers.
+ *   Accepts the already-resolved blockStateStr (not derived from block.getBlockData()
+ *   post-cancel, which was the v3 bug).
  *
- * SLAVE mode:
- *   sendAction(world, x, y, z, action, block) – encodes a BlockSyncMessage and sends
- *   it to master via RemoteDataClient.sendBlockAction().
- *
- *   applyPush(BlockSyncMessage) – applies a BLOCK_PUSH received from master.
- *   Schedules on the main thread via MinecraftServer.execute().
- *
- * Slaves cancel local block events (see RemoteBlockListener) and ONLY render
- * what master broadcasts — master is the single source of truth.
+ * applyPush():
+ *   Applies a BlockSyncMessage to this server's world on the main thread.
+ *   If the chunk is not loaded it is force-loaded synchronously (safe on main thread).
+ *   Physics suppressed (false) to avoid cascading updates on slave displays.
  */
 public final class RemoteBlockHandler {
 
@@ -38,31 +35,43 @@ public final class RemoteBlockHandler {
 
     /**
      * Called from RemoteBlockListener on SLAVE servers.
-     * Encodes the block change as a BlockSyncMessage and fires it to master.
+     * blockStateStr must already be resolved by the caller (avoids the
+     * post-cancel getBlockData() ambiguity that existed in v3).
      */
     public static void sendAction(World world, int x, int y, int z,
-                                  byte action, Block block) {
+                                  byte action, String blockStateStr) {
         RemoteDataClient client = RemoteDataClient.get();
-        if (client == null || !client.isConnected()) return;
-
-        String blockStateStr = (action == BlockSyncMessage.ACTION_BREAK)
-                ? "minecraft:air"
-                : block.getBlockData().getAsString();
-
+        if (client == null || !client.isConnected()) {
+            LOGGER.fine("[RemoteData] sendAction skipped – not connected to master");
+            return;
+        }
         BlockSyncMessage msg = new BlockSyncMessage(
                 action, x, y, z, System.currentTimeMillis(),
                 blockStateStr, world.getName());
-
         client.sendBlockAction(msg);
-        LOGGER.fine("[RemoteData] Sent BLOCK_ACTION pos=" + msg.posKey()
-                + " action=" + action + " block=" + blockStateStr);
+        LOGGER.fine("[RemoteData] Sent BLOCK_ACTION " + msg);
     }
 
-    // ── Apply path (used on MASTER directly, and on SLAVES from BLOCK_PUSH) ──
+    /**
+     * Overload kept for compatibility. Derives blockStateStr from block.
+     * NOTE: Only safe to call BEFORE the event is cancelled; pass the Block
+     * reference whose state reflects what the player intends to place/break.
+     */
+    public static void sendAction(World world, int x, int y, int z,
+                                  byte action, Block block) {
+        String blockStateStr = (action == BlockSyncMessage.ACTION_BREAK)
+                ? "minecraft:air"
+                : block.getBlockData().getAsString();
+        sendAction(world, x, y, z, action, blockStateStr);
+    }
+
+    // ── Apply path ────────────────────────────────────────────────────────────
 
     /**
      * Apply a BlockSyncMessage to this server's world.
-     * Schedules on the main thread.  Safe to call from any thread.
+     * Must be called (or rescheduled) on the server main thread.
+     * If the chunk containing the block is not loaded it will be force-loaded
+     * so the update is never silently dropped.
      */
     public static void applyPush(BlockSyncMessage msg) {
         MinecraftServer server = MinecraftServer.getServer();
@@ -78,20 +87,35 @@ public final class RemoteBlockHandler {
 
                 int chunkX = msg.x >> 4;
                 int chunkZ = msg.z >> 4;
+
+                // Force-load if not loaded so the update is never dropped
                 if (!world.isChunkLoaded(chunkX, chunkZ)) {
-                    LOGGER.fine("[RemoteData] applyPush: chunk not loaded, skipping pos=" + msg.posKey());
-                    return;
+                    world.loadChunk(chunkX, chunkZ, false); // false = don't generate new chunks
+                    if (!world.isChunkLoaded(chunkX, chunkZ)) {
+                        // Chunk doesn't exist (ungenerated area) – skip
+                        LOGGER.fine("[RemoteData] applyPush: chunk ungenerated, skipping pos=" + msg.posKey());
+                        return;
+                    }
                 }
 
                 String blockStateStr = (msg.action == BlockSyncMessage.ACTION_BREAK
-                        || msg.blockData == null || msg.blockData.isEmpty())
+                        || msg.blockData == null || msg.blockData.isBlank())
                         ? "minecraft:air"
                         : msg.blockData;
 
-                BlockData newData = Bukkit.createBlockData(blockStateStr);
+                BlockData newData;
+                try {
+                    newData = Bukkit.createBlockData(blockStateStr);
+                } catch (IllegalArgumentException e) {
+                    LOGGER.warning("[RemoteData] applyPush: invalid blockstate '" + blockStateStr
+                            + "' at pos=" + msg.posKey() + " – defaulting to air");
+                    newData = Bukkit.createBlockData(Material.AIR);
+                }
+
                 Block block = world.getBlockAt(msg.x, msg.y, msg.z);
-                block.setBlockData(newData, false); // false = no physics cascade
-                LOGGER.fine("[RemoteData] Applied block pos=" + msg.posKey() + " state=" + blockStateStr);
+                block.setBlockData(newData, false); // false = suppress physics cascade on display servers
+
+                LOGGER.fine("[RemoteData] Applied " + msg);
 
             } catch (Exception e) {
                 LOGGER.log(Level.WARNING, "[RemoteData] applyPush error pos=" + msg.posKey(), e);
@@ -99,16 +123,16 @@ public final class RemoteBlockHandler {
         });
     }
 
-    // ── Legacy key-based overload (used by RemoteDataClient BLOCK_PUSH path) ─
+    // ── Legacy key-based overload ─────────────────────────────────────────────
 
     /**
-     * Legacy overload kept for compatibility with the old BLOCK_PUSH path.
-     * key = "world/x/y/z", data = blockStateString bytes.
+     * Legacy overload: key = "worldName/x/y/z", data = blockState UTF-8 bytes.
+     * Kept for compatibility with old BLOCK_PUSH handling path.
      */
     public static void applyPush(String key, byte[] data) {
         String[] parts = key.split("/");
         if (parts.length != 4) {
-            LOGGER.warning("[RemoteData] applyPush: bad key: " + key);
+            LOGGER.warning("[RemoteData] applyPush legacy: bad key: " + key);
             return;
         }
         try {
@@ -124,11 +148,11 @@ public final class RemoteBlockHandler {
                     System.currentTimeMillis(), blockStateStr, worldName);
             applyPush(msg);
         } catch (NumberFormatException e) {
-            LOGGER.warning("[RemoteData] applyPush: bad coords in key: " + key);
+            LOGGER.warning("[RemoteData] applyPush legacy: bad coords in key: " + key);
         }
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── Key helper ────────────────────────────────────────────────────────────
 
     public static String buildKey(String worldName, int x, int y, int z) {
         return worldName + "/" + x + "/" + y + "/" + z;

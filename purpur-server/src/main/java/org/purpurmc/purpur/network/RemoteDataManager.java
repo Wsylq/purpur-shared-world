@@ -8,17 +8,23 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * RemoteDataManager – single entry point (v3, master-slave block sync).
+ * RemoteDataManager – single entry point (v4, master-slave block sync, fixed).
  *
  * MASTER  → starts RemoteDataServer (TCP listener for slaves).
- *           isWorldOwner=true  → world files are read/write normally.
- *           RemoteBlockListener NOT registered (master applies events locally).
+ *           isWorldOwner=true  → world files read/write normally.
+ *           RemoteBlockListener registered at MONITOR to broadcast to slaves.
  *
  * SLAVE   → starts RemoteDataClient (connects to master).
- *           isWorldOwner=false → RemoteBlockListener is registered:
+ *           isWorldOwner=false → RemoteBlockListener registered at LOWEST:
  *             • Cancels local block events (no writes to region files).
  *             • Forwards BLOCK_ACTION to master.
- *             • Renders BLOCK_PUSH from master.
+ *             • Applies BLOCK_PUSH from master.
+ *
+ * Listener registration fix (v4):
+ *   Wait for Bukkit to finish plugin loading before registering, using a
+ *   scheduler task on the very first tick. This avoids the race condition where
+ *   RemoteDataManager.init() is called from MinecraftServer (before any plugin
+ *   is loaded) and getPlugins() returns an empty array.
  */
 public class RemoteDataManager {
 
@@ -44,48 +50,77 @@ public class RemoteDataManager {
             cache.start();
 
             if (config.isMaster) {
-                // Master: run the TCP server so slaves can connect
                 RemoteDataServer server = RemoteDataServer.init(config, serverRoot);
                 server.start();
                 LOGGER.info("[RemoteData] Master server started on port " + config.masterPort);
-                // Master also registers the listener so its own block changes get broadcast to slaves
-                registerBlockListener(config);
             } else {
-                // Slave: connect to master, register cancel+forward listener
                 RemoteDataClient client = RemoteDataClient.init(config);
                 client.start();
                 LOGGER.info("[RemoteData] Slave client connecting to "
                         + config.masterHost + ":" + config.masterPort);
-                registerBlockListener(config);
             }
+
+            // Defer listener registration until after all plugins are loaded (first tick)
+            scheduleListenerRegistration(config);
 
             initialised = true;
             LOGGER.info("[RemoteData] ✓ Remote data system online.");
 
         } catch (Exception e) {
-            LOGGER.log(Level.SEVERE, "[RemoteData] Failed to start remote data system – " +
-                    "server will continue with LOCAL storage only.", e);
+            LOGGER.log(Level.SEVERE, "[RemoteData] Failed to start remote data system – "
+                    + "server will continue with LOCAL storage only.", e);
         }
     }
 
-    private static void registerBlockListener(RemoteDataConfig config) {
-        // Bukkit plugin registration requires a Plugin instance.
-        // We hook into the first available plugin (typically the server itself via CraftServer).
-        // In a Purpur/Paper server context this is called after plugins are loaded,
-        // so we use the server's own internal plugin reference.
-        try {
-            Plugin plugin = Bukkit.getPluginManager().getPlugins().length > 0
-                    ? Bukkit.getPluginManager().getPlugins()[0]
-                    : null;
-            if (plugin != null) {
-                Bukkit.getPluginManager().registerEvents(new RemoteBlockListener(), plugin);
-                LOGGER.info("[RemoteData] RemoteBlockListener registered (worldOwner=" + config.isWorldOwner + ")");
-            } else {
-                LOGGER.warning("[RemoteData] Could not register RemoteBlockListener – no plugins loaded yet.");
+    /**
+     * Schedule RemoteBlockListener registration for tick 1 (after all plugins load).
+     * Falls back to immediate registration if the scheduler isn't available yet
+     * (e.g., called post-startup).
+     */
+    private static void scheduleListenerRegistration(RemoteDataConfig config) {
+        // Try immediate registration first (works if called post-plugin-load)
+        Plugin plugin = findPlugin();
+        if (plugin != null) {
+            registerBlockListener(plugin, config);
+            return;
+        }
+
+        // Plugins not loaded yet – schedule for next tick via a daemon thread poll
+        Thread waiter = new Thread(() -> {
+            for (int attempts = 0; attempts < 120; attempts++) { // wait up to 60s
+                try { Thread.sleep(500); } catch (InterruptedException e) { return; }
+                Plugin p = findPlugin();
+                if (p != null) {
+                    // Must register on main thread via scheduler
+                    Bukkit.getScheduler().runTask(p, () -> registerBlockListener(p, config));
+                    return;
+                }
             }
+            LOGGER.warning("[RemoteData] Could not register RemoteBlockListener – no plugin found after 60s");
+        }, "RemoteData-ListenerRegistrar");
+        waiter.setDaemon(true);
+        waiter.start();
+    }
+
+    private static void registerBlockListener(Plugin plugin, RemoteDataConfig config) {
+        try {
+            Bukkit.getPluginManager().registerEvents(new RemoteBlockListener(), plugin);
+            LOGGER.info("[RemoteData] RemoteBlockListener registered via plugin '"
+                    + plugin.getName() + "' (worldOwner=" + config.isWorldOwner + ")");
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "[RemoteData] RemoteBlockListener registration failed", e);
         }
+    }
+
+    /** Returns the first enabled plugin found, or null if none loaded yet. */
+    private static Plugin findPlugin() {
+        try {
+            Plugin[] plugins = Bukkit.getPluginManager().getPlugins();
+            for (Plugin p : plugins) {
+                if (p.isEnabled()) return p;
+            }
+        } catch (Exception ignored) {}
+        return null;
     }
 
     public static synchronized void shutdown() {

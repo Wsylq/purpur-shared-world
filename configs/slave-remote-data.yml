@@ -1,0 +1,35 @@
+remote-data:
+  # Set to true to activate the sync system
+  enabled: true
+
+  # "slave" = this server forwards block events to master and renders master's broadcasts
+  mode: slave
+
+  # false = this server does NOT write to world files
+  world-owner: false
+
+  # IP address of the MASTER server (not 0.0.0.0 – use the actual master IP)
+  master-host: play2.eternalzero.cloud
+
+  # Same port as master
+  master-port: 26668
+
+  # MUST be identical to the master's secret-key
+  secret-key: reyansh
+
+  use-tls: false
+  tls-keystore-path: keystore.jks
+  tls-keystore-password: changeit
+
+  cache:
+    max-chunk-entries: 4096
+    dirty-flush-interval-ticks: 100
+    wal-enabled: true
+    wal-path: remote-wal.log
+
+  sync:
+    batch-size: 32
+    compression-enabled: true
+    connect-timeout-ms: 5000
+    short-timeout-ms: 5000
+    chunk-put-timeout-ms: 30000

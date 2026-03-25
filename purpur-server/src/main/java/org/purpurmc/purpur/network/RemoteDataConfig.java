@@ -9,19 +9,36 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * RemoteDataConfig – v3 (master-slave block sync)
+ * RemoteDataConfig – v4 (master-slave block sync, fixed)
  *
- * New field: worldOwner (true = this server is Master / World Owner)
+ * Reads from remote-data.yml in the server root directory.
+ * Generated automatically on first run with safe defaults.
  *
- * remote-data.yml example:
+ * ── MASTER config example (remote-data.yml) ──────────────────────────────────
  *
  *   remote-data:
  *     enabled: true
- *     mode: master          # "master" or "slave"
- *     world-owner: true     # true on Master only; slaves set this to false
- *     master-host: 127.0.0.1
+ *     mode: master           # This server owns the world files
+ *     world-owner: true      # Must be true on master
+ *     master-host: 0.0.0.0   # Bind address (0.0.0.0 = all interfaces)
  *     master-port: 25580
- *     secret-key: CHANGE_ME
+ *     secret-key: my-super-secret-key-change-this
+ *
+ * ── SLAVE config example (remote-data.yml) ───────────────────────────────────
+ *
+ *   remote-data:
+ *     enabled: true
+ *     mode: slave            # This server reads world files only
+ *     world-owner: false     # Must be false on slaves
+ *     master-host: 192.168.1.100   # IP of the master server
+ *     master-port: 25580
+ *     secret-key: my-super-secret-key-change-this  # Same as master!
+ *
+ * ── Notes ─────────────────────────────────────────────────────────────────────
+ *   - secret-key MUST match on all servers or authentication will fail.
+ *   - Multiple slaves can connect to one master simultaneously.
+ *   - The master applies blocks locally AND broadcasts to all slaves.
+ *   - Slaves cancel local block events and forward them to master.
  */
 public class RemoteDataConfig {
 
@@ -31,24 +48,29 @@ public class RemoteDataConfig {
     public static RemoteDataConfig get()                 { return INSTANCE; }
     public static RemoteDataConfig init(File serverRoot) { INSTANCE = new RemoteDataConfig(serverRoot); return INSTANCE; }
 
+    // ── Mode & ownership ─────────────────────────────────────────────────────
     public final boolean enabled;
     public final boolean isMaster;      // true  → run RemoteDataServer (TCP listener)
-    public final boolean isWorldOwner;  // true  → this server owns the world files (writes allowed)
-                                        // false → read-only; cancel local block events, forward to master
+    public final boolean isWorldOwner;  // true  → this server owns world files (writes allowed)
+                                        // false → read-only; cancel local events, forward to master
 
+    // ── Network ───────────────────────────────────────────────────────────────
     public final String  masterHost;
     public final int     masterPort;
     public final String  secretKey;
 
+    // ── TLS (optional) ────────────────────────────────────────────────────────
     public final boolean useTLS;
     public final String  tlsKeystorePath;
     public final String  tlsKeystorePassword;
 
+    // ── Cache ─────────────────────────────────────────────────────────────────
     public final int     maxChunkCacheEntries;
     public final int     dirtyFlushIntervalTicks;
     public final boolean walEnabled;
     public final String  walPath;
 
+    // ── Sync tuning ───────────────────────────────────────────────────────────
     public final int     batchSize;
     public final boolean compressionEnabled;
     public final int     connectTimeoutMs;
@@ -56,52 +78,54 @@ public class RemoteDataConfig {
     public final long    chunkPutTimeoutMs;
 
     private RemoteDataConfig(File serverRoot) {
-        File configFile = new File(serverRoot, "remote-data.yml");
-        YamlConfiguration cfg = new YamlConfiguration();
+        File              configFile = new File(serverRoot, "remote-data.yml");
+        YamlConfiguration cfg        = new YamlConfiguration();
+
         if (configFile.exists()) {
             try { cfg.load(configFile); }
             catch (IOException | InvalidConfigurationException e) {
                 LOGGER.log(Level.SEVERE, "[RemoteData] Failed to load remote-data.yml – using defaults", e);
             }
         } else {
-            LOGGER.warning("[RemoteData] remote-data.yml not found – remote data system disabled.");
+            LOGGER.warning("[RemoteData] remote-data.yml not found – generating defaults and disabling system.");
         }
 
         enabled      = cfg.getBoolean("remote-data.enabled", false);
         String mode  = cfg.getString("remote-data.mode", "slave");
         isMaster     = "master".equalsIgnoreCase(mode);
-        // world-owner defaults to true only when mode=master, so a simple upgrade works
+
+        // world-owner defaults to isMaster so a simple one-line upgrade works
         isWorldOwner = cfg.getBoolean("remote-data.world-owner", isMaster);
 
         masterHost = cfg.getString("remote-data.master-host", "127.0.0.1");
         masterPort = cfg.getInt   ("remote-data.master-port", 25580);
-        secretKey  = cfg.getString("remote-data.secret-key",  "CHANGE_ME");
+        secretKey  = cfg.getString("remote-data.secret-key",  "CHANGE_ME_OR_AUTH_WILL_FAIL");
 
-        useTLS              = cfg.getBoolean("remote-data.use-tls", false);
-        tlsKeystorePath     = cfg.getString ("remote-data.tls-keystore-path",     "keystore.jks");
-        tlsKeystorePassword = cfg.getString ("remote-data.tls-keystore-password", "changeit");
+        useTLS              = cfg.getBoolean("remote-data.use-tls",              false);
+        tlsKeystorePath     = cfg.getString ("remote-data.tls-keystore-path",    "keystore.jks");
+        tlsKeystorePassword = cfg.getString ("remote-data.tls-keystore-password","changeit");
 
-        maxChunkCacheEntries    = cfg.getInt    ("remote-data.cache.max-chunk-entries",          4096);
+        maxChunkCacheEntries    = cfg.getInt    ("remote-data.cache.max-chunk-entries",         4096);
         dirtyFlushIntervalTicks = cfg.getInt    ("remote-data.cache.dirty-flush-interval-ticks", 100);
-        walEnabled              = cfg.getBoolean("remote-data.cache.wal-enabled", true);
-        walPath                 = cfg.getString ("remote-data.cache.wal-path",    "remote-wal.log");
+        walEnabled              = cfg.getBoolean("remote-data.cache.wal-enabled",                true);
+        walPath                 = cfg.getString ("remote-data.cache.wal-path",                   "remote-wal.log");
 
-        batchSize          = cfg.getInt    ("remote-data.sync.batch-size",          32);
-        compressionEnabled = cfg.getBoolean("remote-data.sync.compression-enabled", true);
-        connectTimeoutMs   = cfg.getInt    ("remote-data.sync.connect-timeout-ms",  5000);
+        batchSize          = cfg.getInt    ("remote-data.sync.batch-size",           32);
+        compressionEnabled = cfg.getBoolean("remote-data.sync.compression-enabled",  true);
+        connectTimeoutMs   = cfg.getInt    ("remote-data.sync.connect-timeout-ms",   5000);
 
-        int legacyTimeout  = cfg.getInt("remote-data.sync.read-timeout-ms", -1);
-        shortTimeoutMs     = cfg.getLong("remote-data.sync.short-timeout-ms",
-                legacyTimeout > 0 ? legacyTimeout : 5000L);
-        chunkPutTimeoutMs  = cfg.getLong("remote-data.sync.chunk-put-timeout-ms", 30_000L);
+        int legacyTimeout = cfg.getInt("remote-data.sync.read-timeout-ms", -1);
+        shortTimeoutMs    = cfg.getLong("remote-data.sync.short-timeout-ms",
+                legacyTimeout > 0 ? legacyTimeout : 5_000L);
+        chunkPutTimeoutMs = cfg.getLong("remote-data.sync.chunk-put-timeout-ms", 30_000L);
 
         if (!configFile.exists()) writeDefaults(configFile, cfg);
 
         if (enabled) {
             LOGGER.info("[RemoteData] Mode: " + (isMaster ? "MASTER" : "SLAVE")
                     + " | WorldOwner: " + isWorldOwner
-                    + " | Host: " + masterHost + ":" + masterPort
-                    + " | TLS: " + useTLS
+                    + " | Host: "       + masterHost + ":" + masterPort
+                    + " | TLS: "        + useTLS
                     + " | Compression: " + compressionEnabled
                     + " | shortTimeout: " + shortTimeoutMs + "ms"
                     + " | chunkPutTimeout: " + chunkPutTimeoutMs + "ms");
@@ -114,7 +138,7 @@ public class RemoteDataConfig {
         cfg.set("remote-data.world-owner",                           false);
         cfg.set("remote-data.master-host",                           "127.0.0.1");
         cfg.set("remote-data.master-port",                           25580);
-        cfg.set("remote-data.secret-key",                            "CHANGE_ME");
+        cfg.set("remote-data.secret-key",                            "CHANGE_ME_OR_AUTH_WILL_FAIL");
         cfg.set("remote-data.use-tls",                               false);
         cfg.set("remote-data.tls-keystore-path",                     "keystore.jks");
         cfg.set("remote-data.tls-keystore-password",                 "changeit");
@@ -127,7 +151,11 @@ public class RemoteDataConfig {
         cfg.set("remote-data.sync.connect-timeout-ms",               5000);
         cfg.set("remote-data.sync.short-timeout-ms",                 5000);
         cfg.set("remote-data.sync.chunk-put-timeout-ms",             30000);
-        try { cfg.save(configFile); LOGGER.info("[RemoteData] Generated default remote-data.yml"); }
-        catch (IOException e) { LOGGER.log(Level.WARNING, "[RemoteData] Could not write default config", e); }
+        try {
+            cfg.save(configFile);
+            LOGGER.info("[RemoteData] Generated default remote-data.yml");
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "[RemoteData] Could not write default config", e);
+        }
     }
 }
