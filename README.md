@@ -3,7 +3,7 @@
 ## TO-DO
 
 * Chat
-* Syncing Blocks --> `Currently here`
+* Syncing Blocks --> `DONE`
 * Syncing Inventories across Both servers
 * Player Position
 * Real Players
