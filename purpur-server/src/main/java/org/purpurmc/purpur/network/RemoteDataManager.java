@@ -8,9 +8,11 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * RemoteDataManager – single entry point (v5, block + chat sync).
+ * RemoteDataManager – single entry point (v6, block + chat + mob sync).
  *
- * v5 change: registers RemoteChatListener alongside RemoteBlockListener.
+ * v6 changes:
+ *   MASTER: starts MobSyncBroadcaster, registers MobDamageListener.
+ *   SLAVE:  registers MobSpawnListener (blocks natural spawning).
  */
 public class RemoteDataManager {
 
@@ -39,6 +41,8 @@ public class RemoteDataManager {
             if (config.isMaster) {
                 RemoteDataServer server = RemoteDataServer.init(config, serverRoot);
                 server.start();
+                // Init broadcaster (started later when a plugin is available)
+                MobSyncBroadcaster.init(config);
                 LOGGER.info("[RemoteData] Master server started on port " + config.masterPort);
             } else {
                 RemoteDataClient client = RemoteDataClient.init(config);
@@ -47,7 +51,6 @@ public class RemoteDataManager {
                         + config.masterHost + ":" + config.masterPort);
             }
 
-            // Defer listener registration until after all plugins are loaded (first tick)
             scheduleListenerRegistration(config);
 
             initialised = true;
@@ -59,10 +62,6 @@ public class RemoteDataManager {
         }
     }
 
-    /**
-     * Schedule both RemoteBlockListener and RemoteChatListener registration for tick 1.
-     * Falls back to immediate registration if plugins are already loaded.
-     */
     private static void scheduleListenerRegistration(RemoteDataConfig config) {
         Plugin plugin = findPlugin();
         if (plugin != null) {
@@ -89,13 +88,28 @@ public class RemoteDataManager {
         try {
             // Block sync listener (place/break/piston/etc.)
             Bukkit.getPluginManager().registerEvents(new RemoteBlockListener(), plugin);
-            LOGGER.info("[RemoteData] RemoteBlockListener registered via plugin '"
-                    + plugin.getName() + "' (worldOwner=" + config.isWorldOwner + ")");
+            LOGGER.info("[RemoteData] RemoteBlockListener registered (worldOwner=" + config.isWorldOwner + ")");
 
             // Chat sync listener (chat/advancement/join/quit/death/commands)
             Bukkit.getPluginManager().registerEvents(new RemoteChatListener(), plugin);
-            LOGGER.info("[RemoteData] RemoteChatListener registered via plugin '"
-                    + plugin.getName() + "' (serverName=" + config.serverName + ")");
+            LOGGER.info("[RemoteData] RemoteChatListener registered (serverName=" + config.serverName + ")");
+
+            if (config.isMaster) {
+                // Damage listener: broadcasts health updates to slaves immediately on hit
+                Bukkit.getPluginManager().registerEvents(new MobDamageListener(), plugin);
+                LOGGER.info("[RemoteData] MobDamageListener registered (MASTER)");
+
+                // Start the periodic mob position broadcaster
+                MobSyncBroadcaster broadcaster = MobSyncBroadcaster.get();
+                if (broadcaster != null) {
+                    broadcaster.start(plugin);
+                    LOGGER.info("[RemoteData] MobSyncBroadcaster started (MASTER)");
+                }
+            } else {
+                // Spawn blocker: prevent natural mob spawning on slaves
+                Bukkit.getPluginManager().registerEvents(new MobSpawnListener(), plugin);
+                LOGGER.info("[RemoteData] MobSpawnListener registered (SLAVE – natural spawning blocked)");
+            }
 
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "[RemoteData] Listener registration failed", e);
@@ -115,6 +129,9 @@ public class RemoteDataManager {
     public static synchronized void shutdown() {
         if (!initialised) return;
         LOGGER.info("[RemoteData] Shutting down remote data system...");
+
+        MobSyncBroadcaster broadcaster = MobSyncBroadcaster.get();
+        if (broadcaster != null) broadcaster.stop();
 
         RemoteDataCache  cache  = RemoteDataCache.get();
         if (cache  != null) cache.stop();

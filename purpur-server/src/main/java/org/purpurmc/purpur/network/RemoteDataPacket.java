@@ -6,7 +6,7 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
 /**
- * RemoteDataPacket – binary protocol (v5, block + chat sync)
+ * RemoteDataPacket – binary protocol (v6, block + chat + mob sync)
  *
  * Wire format (all big-endian):
  *   [4 bytes] magic       = 0x52444154 ('RDAT')
@@ -19,9 +19,9 @@ import java.util.zip.GZIPOutputStream;
  *   [M bytes] data
  *   [32 bytes] HMAC-SHA256
  *
- * OpCodes added in v5:
- *   CHAT_ACTION  (0x18) – slave → master: encoded ChatSyncMessage
- *   CHAT_PUSH    (0x97) – master → slaves: encoded ChatSyncMessage (requestId=0)
+ * OpCodes added in v6:
+ *   MOB_ATTACK_ACTION (0x19) – slave → master: encoded MobAttackMessage
+ *   MOB_PUSH          (0x98) – master → slaves: encoded MobSyncMessage (requestId=0)
  */
 public class RemoteDataPacket {
 
@@ -41,6 +41,7 @@ public class RemoteDataPacket {
         CHUNK_PUSH_ACK   (0x16),
         BLOCK_ACTION     (0x17),   // slave sends a block place/break to master
         CHAT_ACTION      (0x18),   // slave sends a chat/advancement/join/quit/death event to master
+        MOB_ATTACK_ACTION(0x19),   // slave player attacked a mob → forward to master
 
         // Master → Client
         PONG             (0x81),
@@ -53,7 +54,8 @@ public class RemoteDataPacket {
         LIST_RESULT      (0x94),
         CHUNK_PUSH       (0x95),
         BLOCK_PUSH       (0x96),  // master broadcasts applied block state to all slaves
-        CHAT_PUSH        (0x97);  // master broadcasts chat/advancement/join/quit/death to all slaves
+        CHAT_PUSH        (0x97),  // master broadcasts chat/advancement/join/quit/death to all slaves
+        MOB_PUSH         (0x98);  // master broadcasts mob position/health to all slaves
 
         public final byte code;
         OpCode(int code) { this.code = (byte) code; }

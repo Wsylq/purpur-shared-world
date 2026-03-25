@@ -10,45 +10,43 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * RemoteDataClient – SLAVE server side (v5, block + chat sync).
+ * RemoteDataClient – SLAVE server side (v6, block + chat + mob sync).
  *
- * Added in v5:
- *   sendChatEventDirect(ChatSyncMessage) – blocking CHAT_ACTION to master (call from non-main thread).
- *   Incoming CHAT_PUSH (requestId=0) decoded and applied via RemoteChatListener.applyPush().
+ * Added in v6:
+ *   sendMobAttackDirect(MobAttackMessage) – forward a player attack to master.
+ *   Incoming MOB_PUSH (requestId=0)       – decoded and applied via MobSyncHandler.
+ *   MobSyncHandler.clearAll()             – called on connect/disconnect.
  */
 public class RemoteDataClient {
 
     private static final Logger LOGGER = Logger.getLogger("RemoteDataClient");
 
-    // ── Singleton ─────────────────────────────────────────────────────────────
+    // ── Singleton ────────────────────────────────────────────────────────────────
     private static RemoteDataClient INSTANCE;
-    public static RemoteDataClient get()                      { return INSTANCE; }
-    public static RemoteDataClient init(RemoteDataConfig cfg) { INSTANCE = new RemoteDataClient(cfg); return INSTANCE; }
+    public static RemoteDataClient get()                         { return INSTANCE; }
+    public static RemoteDataClient init(RemoteDataConfig cfg)    { INSTANCE = new RemoteDataClient(cfg); return INSTANCE; }
 
-    // ── Fields ────────────────────────────────────────────────────────────────
+    // ── Fields ───────────────────────────────────────────────────────────────────
     private final RemoteDataConfig config;
-    private final HmacHelper       hmac;
-    private final AtomicInteger    requestIdGen = new AtomicInteger(1);
-
-    private final ConcurrentHashMap<Integer, CompletableFuture<RemoteDataPacket>> pending      = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String,  CompletableFuture<Boolean>>          inFlightPuts = new ConcurrentHashMap<>();
-
+    private final HmacHelper hmac;
+    private final AtomicInteger requestIdGen = new AtomicInteger(1);
+    private final ConcurrentHashMap<Integer, CompletableFuture<RemoteDataPacket>> pending        = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String,  CompletableFuture<Boolean>>          inFlightPuts   = new ConcurrentHashMap<>();
     private volatile Socket           socket;
     private volatile DataInputStream  dis;
     private volatile DataOutputStream dos;
-    private volatile boolean          connected  = false;
-    private volatile boolean          running    = false;
-
+    private volatile boolean connected  = false;
+    private volatile boolean running    = false;
     private Thread readerThread;
     private Thread reconnectThread;
 
-    // ── Constructor ───────────────────────────────────────────────────────────
+    // ── Constructor ──────────────────────────────────────────────────────────────
     public RemoteDataClient(RemoteDataConfig config) {
         this.config = config;
         this.hmac   = new HmacHelper(config.secretKey);
     }
 
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
+    // ── Lifecycle ────────────────────────────────────────────────────────────────
     public void start() {
         running = true;
         reconnectThread = new Thread(this::reconnectLoop, "RemoteData-Reconnect");
@@ -61,13 +59,14 @@ public class RemoteDataClient {
         running = false;
         if (reconnectThread != null) reconnectThread.interrupt();
         if (readerThread    != null) readerThread.interrupt();
+        MobSyncHandler.clearAll();
         closeSocket();
         LOGGER.info("[RemoteData] Client stopped.");
     }
 
     public boolean isConnected() { return connected; }
 
-    // ── Public API ────────────────────────────────────────────────────────────
+    // ── Public API ───────────────────────────────────────────────────────────────
 
     public byte[] get(String key) {
         if (!connected) return null;
@@ -107,20 +106,13 @@ public class RemoteDataClient {
         }
     }
 
-    /**
-     * Send a BLOCK_ACTION to master.
-     * Fire-and-forget on a virtual thread – never blocks the Minecraft main thread.
-     */
+    /** Send a BLOCK_ACTION to master. Fire-and-forget on virtual thread. */
     public void sendBlockAction(BlockSyncMessage msg) {
-        if (!connected) {
-            LOGGER.fine("[RemoteData] sendBlockAction skipped – not connected");
-            return;
-        }
+        if (!connected) { LOGGER.fine("[RemoteData] sendBlockAction skipped – not connected"); return; }
         Thread.ofVirtual().name("RemoteData-BlockAction").start(() -> {
             try {
                 byte[] encoded = msg.encode();
-                sendAndWait(
-                        new RemoteDataPacket(RemoteDataPacket.OpCode.BLOCK_ACTION, nextId(), "", encoded),
+                sendAndWait(new RemoteDataPacket(RemoteDataPacket.OpCode.BLOCK_ACTION, nextId(), "", encoded),
                         config.shortTimeoutMs);
             } catch (Exception e) {
                 LOGGER.log(Level.FINE, "[RemoteData] BLOCK_ACTION failed pos=" + msg.posKey(), e);
@@ -128,22 +120,30 @@ public class RemoteDataClient {
         });
     }
 
-    /**
-     * Send a CHAT_ACTION to master (chat, advancement, join, quit, death, command).
-     * Called directly – must already be on a non-main thread (virtual thread is fine).
-     */
+    /** Send a CHAT_ACTION to master. Must already be on a non-main thread. */
     public void sendChatEventDirect(ChatSyncMessage msg) {
-        if (!connected) {
-            LOGGER.fine("[RemoteData] sendChatEventDirect skipped – not connected");
-            return;
-        }
+        if (!connected) { LOGGER.fine("[RemoteData] sendChatEventDirect skipped – not connected"); return; }
         try {
             byte[] encoded = msg.encode();
-            sendAndWait(
-                    new RemoteDataPacket(RemoteDataPacket.OpCode.CHAT_ACTION, nextId(), "", encoded),
+            sendAndWait(new RemoteDataPacket(RemoteDataPacket.OpCode.CHAT_ACTION, nextId(), "", encoded),
                     config.shortTimeoutMs);
         } catch (Exception e) {
             LOGGER.log(Level.FINE, "[RemoteData] CHAT_ACTION failed: " + msg, e);
+        }
+    }
+
+    /**
+     * Forward a player mob-attack to master for authoritative damage processing.
+     * Must already be on a non-main thread (caller wraps in virtual thread).
+     */
+    public void sendMobAttackDirect(MobAttackMessage msg) {
+        if (!connected) { LOGGER.fine("[RemoteData] sendMobAttackDirect skipped – not connected"); return; }
+        try {
+            byte[] encoded = msg.encode();
+            sendAndWait(new RemoteDataPacket(RemoteDataPacket.OpCode.MOB_ATTACK_ACTION, nextId(), "", encoded),
+                    config.shortTimeoutMs);
+        } catch (Exception e) {
+            LOGGER.log(Level.FINE, "[RemoteData] MOB_ATTACK_ACTION failed: " + msg, e);
         }
     }
 
@@ -163,7 +163,7 @@ public class RemoteDataClient {
     public long ping() {
         if (!connected) return -1;
         try {
-            long t    = System.currentTimeMillis();
+            long t = System.currentTimeMillis();
             RemoteDataPacket resp = sendAndWait(
                     new RemoteDataPacket(RemoteDataPacket.OpCode.PING, nextId(), "", null),
                     config.shortTimeoutMs);
@@ -171,8 +171,7 @@ public class RemoteDataClient {
         } catch (Exception e) { return -1; }
     }
 
-    // ── Internal ──────────────────────────────────────────────────────────────
-
+    // ── Internal ─────────────────────────────────────────────────────────────────
     private int nextId() {
         int id = requestIdGen.getAndIncrement();
         if (id == 0) id = requestIdGen.getAndIncrement();
@@ -198,8 +197,7 @@ public class RemoteDataClient {
         }
     }
 
-    // ── Reader thread ─────────────────────────────────────────────────────────
-
+    // ── Reader thread ─────────────────────────────────────────────────────────────
     private void startReader() {
         readerThread = new Thread(() -> {
             while (running && connected) {
@@ -231,10 +229,10 @@ public class RemoteDataClient {
      * BLOCK_PUSH – decode and apply block change on main thread.
      * CHAT_PUSH  – decode and broadcast to all players on this server.
      * CHUNK_PUSH – update local cache.
+     * MOB_PUSH   – decode and apply mob position/health via MobSyncHandler.
      */
     private void handleServerPush(RemoteDataPacket pkt) {
         switch (pkt.opCode) {
-
             case BLOCK_PUSH -> {
                 try {
                     BlockSyncMessage msg = BlockSyncMessage.decode(pkt.data);
@@ -244,18 +242,15 @@ public class RemoteDataClient {
                     LOGGER.log(Level.WARNING, "[RemoteData] BLOCK_PUSH decode/apply failed", e);
                 }
             }
-
             case CHAT_PUSH -> {
                 try {
                     ChatSyncMessage msg = ChatSyncMessage.decode(pkt.data);
-                    // applyPush is async-safe (uses Bukkit.broadcast which handles threading)
                     RemoteChatListener.applyPush(msg);
                     LOGGER.fine("[RemoteData] Received CHAT_PUSH: " + msg);
                 } catch (Exception e) {
                     LOGGER.log(Level.WARNING, "[RemoteData] CHAT_PUSH decode/apply failed", e);
                 }
             }
-
             case CHUNK_PUSH -> {
                 String key = pkt.key;
                 if (pkt.data == null || pkt.data.length == 0) {
@@ -265,19 +260,23 @@ public class RemoteDataClient {
                 }
                 RemoteDataCache cache = RemoteDataCache.get();
                 if (cache != null) cache.putClean(key, pkt.data);
+                try { RemoteChunkDataHandler.applyPush(key, pkt.data); }
+                catch (Exception e) { LOGGER.log(Level.WARNING, "[RemoteData] CHUNK_PUSH apply failed for key=" + key, e); }
+            }
+            case MOB_PUSH -> {
                 try {
-                    RemoteChunkDataHandler.applyPush(key, pkt.data);
+                    MobSyncMessage msg = MobSyncMessage.decode(pkt.data);
+                    MobSyncHandler.applyPush(msg);
+                    LOGGER.fine("[RemoteData] Received MOB_PUSH: " + msg);
                 } catch (Exception e) {
-                    LOGGER.log(Level.WARNING, "[RemoteData] CHUNK_PUSH apply failed for key=" + key, e);
+                    LOGGER.log(Level.WARNING, "[RemoteData] MOB_PUSH decode/apply failed", e);
                 }
             }
-
             default -> LOGGER.fine("[RemoteData] Unknown server push opCode=" + pkt.opCode);
         }
     }
 
-    // ── Reconnect loop ────────────────────────────────────────────────────────
-
+    // ── Reconnect loop ────────────────────────────────────────────────────────────
     private void reconnectLoop() {
         long backoffMs = 1_000;
         while (running) {
@@ -288,13 +287,11 @@ public class RemoteDataClient {
                 } catch (Exception e) {
                     LOGGER.warning("[RemoteData] Could not connect (" + e.getMessage()
                             + "). Retrying in " + (backoffMs / 1000) + "s...");
-                    try { Thread.sleep(backoffMs); }
-                    catch (InterruptedException ie) { break; }
+                    try { Thread.sleep(backoffMs); } catch (InterruptedException ie) { break; }
                     backoffMs = Math.min(backoffMs * 2, 30_000);
                 }
             } else {
-                try { Thread.sleep(2_000); }
-                catch (InterruptedException e) { break; }
+                try { Thread.sleep(2_000); } catch (InterruptedException e) { break; }
             }
         }
     }
@@ -310,7 +307,6 @@ public class RemoteDataClient {
         s.setKeepAlive(true);
         s.setSendBufferSize(256 * 1024);
         s.setReceiveBufferSize(256 * 1024);
-
         socket = s;
         dis = new DataInputStream (new BufferedInputStream (s.getInputStream(),  128 * 1024));
         dos = new DataOutputStream(new BufferedOutputStream(s.getOutputStream(), 128 * 1024));
@@ -324,16 +320,12 @@ public class RemoteDataClient {
         RemoteDataPacket authPkt = new RemoteDataPacket(
                 RemoteDataPacket.OpCode.AUTH, authId, "auth",
                 config.secretKey.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-        synchronized (dos) {
-            authPkt.writeTo(dos, hmac, false);
-            dos.flush();
-        }
+        synchronized (dos) { authPkt.writeTo(dos, hmac, false); dos.flush(); }
 
         try {
             RemoteDataPacket authResp = authFuture.get(config.connectTimeoutMs, TimeUnit.MILLISECONDS);
             if (authResp.opCode != RemoteDataPacket.OpCode.AUTH_OK) {
-                connected = false;
-                closeSocket();
+                connected = false; closeSocket();
                 throw new IOException("Authentication rejected by master");
             }
         } catch (TimeoutException e) {
@@ -341,6 +333,9 @@ public class RemoteDataClient {
         } catch (ExecutionException | InterruptedException e) {
             connected = false; closeSocket(); throw new IOException("Auth failed: " + e.getMessage());
         }
+
+        // Clear stale ghost mobs from previous session
+        MobSyncHandler.clearAll();
 
         LOGGER.info("[RemoteData] Connected and authenticated to master "
                 + config.masterHost + ":" + config.masterPort);
@@ -352,20 +347,18 @@ public class RemoteDataClient {
         pending.clear();
         inFlightPuts.forEach((k, f) -> f.complete(false));
         inFlightPuts.clear();
+        MobSyncHandler.clearAll();
         closeSocket();
     }
 
     private void closeSocket() {
         Socket s = socket;
-        if (s != null && !s.isClosed()) {
-            try { s.close(); } catch (IOException ignored) {}
-        }
+        if (s != null && !s.isClosed()) { try { s.close(); } catch (IOException ignored) {} }
         socket    = null;
         connected = false;
     }
 
-    // ── TLS ───────────────────────────────────────────────────────────────────
-
+    // ── TLS ───────────────────────────────────────────────────────────────────────
     private Socket buildTLSSocket() throws IOException {
         try {
             KeyStore ks = KeyStore.getInstance("JKS");
