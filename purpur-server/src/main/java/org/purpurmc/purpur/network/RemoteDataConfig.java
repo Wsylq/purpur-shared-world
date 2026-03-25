@@ -9,36 +9,29 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * RemoteDataConfig – v4 (master-slave block sync, fixed)
+ * RemoteDataConfig – v5 (block sync + chat sync)
  *
  * Reads from remote-data.yml in the server root directory.
- * Generated automatically on first run with safe defaults.
  *
- * ── MASTER config example (remote-data.yml) ──────────────────────────────────
- *
+ * ── MASTER config example ────────────────────────────────────────────────────
  *   remote-data:
  *     enabled: true
- *     mode: master           # This server owns the world files
- *     world-owner: true      # Must be true on master
- *     master-host: 0.0.0.0   # Bind address (0.0.0.0 = all interfaces)
+ *     mode: master
+ *     world-owner: true
+ *     server-name: "Master"          # shown in cross-server chat as [Master]
+ *     master-host: 0.0.0.0
  *     master-port: 25580
- *     secret-key: my-super-secret-key-change-this
+ *     secret-key: change-me
  *
- * ── SLAVE config example (remote-data.yml) ───────────────────────────────────
- *
+ * ── SLAVE config example ─────────────────────────────────────────────────────
  *   remote-data:
  *     enabled: true
- *     mode: slave            # This server reads world files only
- *     world-owner: false     # Must be false on slaves
- *     master-host: 192.168.1.100   # IP of the master server
+ *     mode: slave
+ *     world-owner: false
+ *     server-name: "Play-1"          # shown in cross-server chat as [Play-1]
+ *     master-host: 192.168.1.100
  *     master-port: 25580
- *     secret-key: my-super-secret-key-change-this  # Same as master!
- *
- * ── Notes ─────────────────────────────────────────────────────────────────────
- *   - secret-key MUST match on all servers or authentication will fail.
- *   - Multiple slaves can connect to one master simultaneously.
- *   - The master applies blocks locally AND broadcasts to all slaves.
- *   - Slaves cancel local block events and forward them to master.
+ *     secret-key: change-me          # must match master
  */
 public class RemoteDataConfig {
 
@@ -52,7 +45,10 @@ public class RemoteDataConfig {
     public final boolean enabled;
     public final boolean isMaster;      // true  → run RemoteDataServer (TCP listener)
     public final boolean isWorldOwner;  // true  → this server owns world files (writes allowed)
-                                        // false → read-only; cancel local events, forward to master
+
+    // ── Identity ──────────────────────────────────────────────────────────────
+    /** Displayed in cross-server chat brackets, e.g. "[Play-1]". */
+    public final String serverName;
 
     // ── Network ───────────────────────────────────────────────────────────────
     public final String  masterHost;
@@ -93,9 +89,8 @@ public class RemoteDataConfig {
         enabled      = cfg.getBoolean("remote-data.enabled", false);
         String mode  = cfg.getString("remote-data.mode", "slave");
         isMaster     = "master".equalsIgnoreCase(mode);
-
-        // world-owner defaults to isMaster so a simple one-line upgrade works
         isWorldOwner = cfg.getBoolean("remote-data.world-owner", isMaster);
+        serverName   = cfg.getString("remote-data.server-name", isMaster ? "Master" : "Slave");
 
         masterHost = cfg.getString("remote-data.master-host", "127.0.0.1");
         masterPort = cfg.getInt   ("remote-data.master-port", 25580);
@@ -105,10 +100,10 @@ public class RemoteDataConfig {
         tlsKeystorePath     = cfg.getString ("remote-data.tls-keystore-path",    "keystore.jks");
         tlsKeystorePassword = cfg.getString ("remote-data.tls-keystore-password","changeit");
 
-        maxChunkCacheEntries    = cfg.getInt    ("remote-data.cache.max-chunk-entries",         4096);
-        dirtyFlushIntervalTicks = cfg.getInt    ("remote-data.cache.dirty-flush-interval-ticks", 100);
-        walEnabled              = cfg.getBoolean("remote-data.cache.wal-enabled",                true);
-        walPath                 = cfg.getString ("remote-data.cache.wal-path",                   "remote-wal.log");
+        maxChunkCacheEntries    = cfg.getInt    ("remote-data.cache.max-chunk-entries",          4096);
+        dirtyFlushIntervalTicks = cfg.getInt    ("remote-data.cache.dirty-flush-interval-ticks",  100);
+        walEnabled              = cfg.getBoolean("remote-data.cache.wal-enabled",                 true);
+        walPath                 = cfg.getString ("remote-data.cache.wal-path",                    "remote-wal.log");
 
         batchSize          = cfg.getInt    ("remote-data.sync.batch-size",           32);
         compressionEnabled = cfg.getBoolean("remote-data.sync.compression-enabled",  true);
@@ -124,11 +119,10 @@ public class RemoteDataConfig {
         if (enabled) {
             LOGGER.info("[RemoteData] Mode: " + (isMaster ? "MASTER" : "SLAVE")
                     + " | WorldOwner: " + isWorldOwner
+                    + " | ServerName: " + serverName
                     + " | Host: "       + masterHost + ":" + masterPort
                     + " | TLS: "        + useTLS
-                    + " | Compression: " + compressionEnabled
-                    + " | shortTimeout: " + shortTimeoutMs + "ms"
-                    + " | chunkPutTimeout: " + chunkPutTimeoutMs + "ms");
+                    + " | Compression: " + compressionEnabled);
         }
     }
 
@@ -136,6 +130,7 @@ public class RemoteDataConfig {
         cfg.set("remote-data.enabled",                               false);
         cfg.set("remote-data.mode",                                  "slave");
         cfg.set("remote-data.world-owner",                           false);
+        cfg.set("remote-data.server-name",                           "Play-1");
         cfg.set("remote-data.master-host",                           "127.0.0.1");
         cfg.set("remote-data.master-port",                           25580);
         cfg.set("remote-data.secret-key",                            "CHANGE_ME_OR_AUTH_WILL_FAIL");

@@ -8,23 +8,9 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * RemoteDataManager – single entry point (v4, master-slave block sync, fixed).
+ * RemoteDataManager – single entry point (v5, block + chat sync).
  *
- * MASTER  → starts RemoteDataServer (TCP listener for slaves).
- *           isWorldOwner=true  → world files read/write normally.
- *           RemoteBlockListener registered at MONITOR to broadcast to slaves.
- *
- * SLAVE   → starts RemoteDataClient (connects to master).
- *           isWorldOwner=false → RemoteBlockListener registered at LOWEST:
- *             • Cancels local block events (no writes to region files).
- *             • Forwards BLOCK_ACTION to master.
- *             • Applies BLOCK_PUSH from master.
- *
- * Listener registration fix (v4):
- *   Wait for Bukkit to finish plugin loading before registering, using a
- *   scheduler task on the very first tick. This avoids the race condition where
- *   RemoteDataManager.init() is called from MinecraftServer (before any plugin
- *   is loaded) and getPlugins() returns an empty array.
+ * v5 change: registers RemoteChatListener alongside RemoteBlockListener.
  */
 public class RemoteDataManager {
 
@@ -43,7 +29,8 @@ public class RemoteDataManager {
 
         LOGGER.info("[RemoteData] Initialising remote data system (mode="
                 + (config.isMaster ? "MASTER" : "SLAVE")
-                + ", worldOwner=" + config.isWorldOwner + ")...");
+                + ", worldOwner=" + config.isWorldOwner
+                + ", serverName=" + config.serverName + ")...");
 
         try {
             RemoteDataCache cache = RemoteDataCache.init(config, serverRoot);
@@ -73,46 +60,48 @@ public class RemoteDataManager {
     }
 
     /**
-     * Schedule RemoteBlockListener registration for tick 1 (after all plugins load).
-     * Falls back to immediate registration if the scheduler isn't available yet
-     * (e.g., called post-startup).
+     * Schedule both RemoteBlockListener and RemoteChatListener registration for tick 1.
+     * Falls back to immediate registration if plugins are already loaded.
      */
     private static void scheduleListenerRegistration(RemoteDataConfig config) {
-        // Try immediate registration first (works if called post-plugin-load)
         Plugin plugin = findPlugin();
         if (plugin != null) {
-            registerBlockListener(plugin, config);
+            registerListeners(plugin, config);
             return;
         }
 
-        // Plugins not loaded yet – schedule for next tick via a daemon thread poll
         Thread waiter = new Thread(() -> {
-            for (int attempts = 0; attempts < 120; attempts++) { // wait up to 60s
+            for (int attempts = 0; attempts < 120; attempts++) {
                 try { Thread.sleep(500); } catch (InterruptedException e) { return; }
                 Plugin p = findPlugin();
                 if (p != null) {
-                    // Must register on main thread via scheduler
-                    Bukkit.getScheduler().runTask(p, () -> registerBlockListener(p, config));
+                    Bukkit.getScheduler().runTask(p, () -> registerListeners(p, config));
                     return;
                 }
             }
-            LOGGER.warning("[RemoteData] Could not register RemoteBlockListener – no plugin found after 60s");
+            LOGGER.warning("[RemoteData] Could not register listeners – no plugin found after 60s");
         }, "RemoteData-ListenerRegistrar");
         waiter.setDaemon(true);
         waiter.start();
     }
 
-    private static void registerBlockListener(Plugin plugin, RemoteDataConfig config) {
+    private static void registerListeners(Plugin plugin, RemoteDataConfig config) {
         try {
+            // Block sync listener (place/break/piston/etc.)
             Bukkit.getPluginManager().registerEvents(new RemoteBlockListener(), plugin);
             LOGGER.info("[RemoteData] RemoteBlockListener registered via plugin '"
                     + plugin.getName() + "' (worldOwner=" + config.isWorldOwner + ")");
+
+            // Chat sync listener (chat/advancement/join/quit/death/commands)
+            Bukkit.getPluginManager().registerEvents(new RemoteChatListener(), plugin);
+            LOGGER.info("[RemoteData] RemoteChatListener registered via plugin '"
+                    + plugin.getName() + "' (serverName=" + config.serverName + ")");
+
         } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "[RemoteData] RemoteBlockListener registration failed", e);
+            LOGGER.log(Level.WARNING, "[RemoteData] Listener registration failed", e);
         }
     }
 
-    /** Returns the first enabled plugin found, or null if none loaded yet. */
     private static Plugin findPlugin() {
         try {
             Plugin[] plugins = Bukkit.getPluginManager().getPlugins();
@@ -127,8 +116,8 @@ public class RemoteDataManager {
         if (!initialised) return;
         LOGGER.info("[RemoteData] Shutting down remote data system...");
 
-        RemoteDataCache cache = RemoteDataCache.get();
-        if (cache != null) cache.stop();
+        RemoteDataCache  cache  = RemoteDataCache.get();
+        if (cache  != null) cache.stop();
 
         RemoteDataClient client = RemoteDataClient.get();
         if (client != null) client.stop();

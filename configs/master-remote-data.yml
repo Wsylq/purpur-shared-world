@@ -8,6 +8,8 @@ remote-data:
   # true = this server reads AND writes world files (the ground truth)
   world-owner: true
 
+  server-name: Master
+
   # The IP/hostname master listens on. 0.0.0.0 = all interfaces
   master-host: 0.0.0.0
 

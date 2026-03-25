@@ -6,7 +6,7 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
 /**
- * RemoteDataPacket – binary protocol (v3, master-slave block sync)
+ * RemoteDataPacket – binary protocol (v5, block + chat sync)
  *
  * Wire format (all big-endian):
  *   [4 bytes] magic       = 0x52444154 ('RDAT')
@@ -19,12 +19,9 @@ import java.util.zip.GZIPOutputStream;
  *   [M bytes] data
  *   [32 bytes] HMAC-SHA256
  *
- * OpCodes:
- *   BLOCK_ACTION  (0x17) – slave → master: encoded BlockSyncMessage
- *   BLOCK_PUSH    (0x96) – master → slaves: encoded BlockSyncMessage (requestId=0)
- *
- * Chunk-level ops (PUT/GET/etc.) are retained for initial world load correctness
- * but block-level sync is the primary real-time path.
+ * OpCodes added in v5:
+ *   CHAT_ACTION  (0x18) – slave → master: encoded ChatSyncMessage
+ *   CHAT_PUSH    (0x97) – master → slaves: encoded ChatSyncMessage (requestId=0)
  */
 public class RemoteDataPacket {
 
@@ -43,6 +40,7 @@ public class RemoteDataPacket {
         CHUNK_INVALIDATE (0x15),
         CHUNK_PUSH_ACK   (0x16),
         BLOCK_ACTION     (0x17),   // slave sends a block place/break to master
+        CHAT_ACTION      (0x18),   // slave sends a chat/advancement/join/quit/death event to master
 
         // Master → Client
         PONG             (0x81),
@@ -54,7 +52,8 @@ public class RemoteDataPacket {
         ERROR            (0x93),
         LIST_RESULT      (0x94),
         CHUNK_PUSH       (0x95),
-        BLOCK_PUSH       (0x96);  // master broadcasts applied block state to all slaves
+        BLOCK_PUSH       (0x96),  // master broadcasts applied block state to all slaves
+        CHAT_PUSH        (0x97);  // master broadcasts chat/advancement/join/quit/death to all slaves
 
         public final byte code;
         OpCode(int code) { this.code = (byte) code; }
