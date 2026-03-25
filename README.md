@@ -15,3 +15,4 @@
 * Liquids not flowing, lava,water etc.
 * Unlimited blocks , as master server places its own blocks.
 * Mobs not spawning and syncing.
+* Physics blocks arent working.
